@@ -49,6 +49,14 @@ Language I18n::languageFromCode(const char* code) {
   return Language::EN;
 }
 
+const char* I18n::getLanguageCode(Language lang) {
+  const auto index = static_cast<size_t>(lang);
+  if (index >= static_cast<size_t>(Language::_COUNT)) {
+    return LANGUAGE_CODES[static_cast<size_t>(Language::EN)];
+  }
+  return LANGUAGE_CODES[index];
+}
+
 // Generate character set for a specific language
 const char* I18n::getCharacterSet(Language lang) {
   const auto langIndex = static_cast<size_t>(lang);

@@ -1,6 +1,7 @@
 #include "TxtReaderActivity.h"
 
 #include <BidiUtils.h>
+#include <Epub/hyphenation/Hyphenator.h>
 #include <FontCacheManager.h>
 #include <GfxRenderer.h>
 #include <HalStorage.h>
@@ -21,7 +22,7 @@ namespace {
 constexpr size_t CHUNK_SIZE = 8 * 1024;  // 8KB chunk for reading
 // Cache file magic and version
 constexpr uint32_t CACHE_MAGIC = 0x54585449;  // "TXTI"
-constexpr uint8_t CACHE_VERSION = 3;          // Increment when cache format changes
+constexpr uint8_t CACHE_VERSION = 4;          // Increment when cache format changes
 }  // namespace
 
 void TxtReaderActivity::onEnter() {
@@ -117,6 +118,11 @@ void TxtReaderActivity::initializeReader() {
   cachedFontId = SETTINGS.getReaderFontId();
   cachedScreenMargin = SETTINGS.screenMargin;
   cachedParagraphAlignment = SETTINGS.paragraphAlignment;
+  cachedHyphenationEnabled = SETTINGS.hyphenationEnabled;
+
+  // Plain text has no language metadata, so use the UI language as the
+  // hyphenation-pattern hint (unknown codes simply disable pattern breaks).
+  Hyphenator::setPreferredLanguage(I18n::getLanguageCode(I18N.getLanguage()));
 
   // Calculate viewport dimensions
   renderer.getOrientedViewableTRBL(&cachedOrientedMarginTop, &cachedOrientedMarginRight, &cachedOrientedMarginBottom,
@@ -252,6 +258,10 @@ bool TxtReaderActivity::loadPageAtOffset(size_t offset, std::vector<std::string>
   // font, so the cost amortizes to ~ASCII-size after the first chunk.
   if (renderer.isSdCardFont(cachedFontId)) {
     renderer.ensureSdCardFontReady(cachedFontId, reinterpret_cast<const char*>(buffer), /*styleMask=*/0x01);
+    if (cachedHyphenationEnabled) {
+      // Inserted hyphens are not necessarily present in the chunk text itself.
+      renderer.ensureSdCardFontReady(cachedFontId, "-", /*styleMask=*/0x01);
+    }
   }
 
   // Parse lines from buffer
@@ -285,58 +295,14 @@ bool TxtReaderActivity::loadPageAtOffset(size_t offset, std::vector<std::string>
     // Track position within this source line (in bytes from pos)
     size_t lineBytePos = 0;
 
-    // Emit at least one visual line for each source line (including blank lines),
-    // then continue with wrapping when needed.
-    do {
-      if (line.empty()) {
-        outLines.emplace_back();
-        break;
-      }
-
-      int lineWidth = renderer.getTextAdvanceX(cachedFontId, line.c_str(), EpdFontFamily::REGULAR);
-
-      if (lineWidth <= viewportWidth) {
-        outLines.push_back(line);
-        lineBytePos = displayLen;  // Consumed entire display content
-        line.clear();
-        break;
-      }
-
-      // Find break point
-      size_t breakPos = line.length();
-      while (breakPos > 0 && renderer.getTextAdvanceX(cachedFontId, line.substr(0, breakPos).c_str(),
-                                                      EpdFontFamily::REGULAR) > viewportWidth) {
-        // Try to break at space
-        size_t spacePos = line.rfind(' ', breakPos - 1);
-        if (spacePos != std::string::npos && spacePos > 0) {
-          breakPos = spacePos;
-        } else {
-          // Break at character boundary for UTF-8
-          breakPos--;
-          // Make sure we don't break in the middle of a UTF-8 sequence
-          while (breakPos > 0 && (line[breakPos] & 0xC0) == 0x80) {
-            breakPos--;
-          }
-        }
-      }
-
-      if (breakPos == 0) {
-        breakPos = 1;
-      }
-
-      outLines.push_back(line.substr(0, breakPos));
-
-      // Skip space at break point
-      size_t skipChars = breakPos;
-      if (breakPos < line.length() && line[breakPos] == ' ') {
-        skipChars++;
-      }
-      lineBytePos += skipChars;
-      line = line.substr(skipChars);
-    } while (!line.empty() && static_cast<int>(outLines.size()) < linesPerPage);
+    if (line.empty()) {
+      outLines.emplace_back();
+    } else {
+      lineBytePos = wrapSourceLine(line, outLines);
+    }
 
     // Determine how much of the source buffer we consumed
-    if (line.empty()) {
+    if (lineBytePos >= displayLen) {
       // Fully consumed this source line, move past the newline
       pos = lineEnd + 1;
     } else {
@@ -363,6 +329,188 @@ bool TxtReaderActivity::loadPageAtOffset(size_t offset, std::vector<std::string>
   free(buffer);
 
   return !outLines.empty();
+}
+
+// Wraps one source line (no CR/LF) into visual lines, appending to outLines until
+// the line is fully consumed or the page is full. Returns bytes of `line` consumed.
+//
+// Break priority at the overflow point: hyphenation of the straddling word (when
+// enabled), else the rightmost space or CJK inter-character opportunity (kinsoku
+// respected), else a hard break at the last fitting codepoint. All width checks
+// use getTextAdvanceX() on the exact string that will be drawn, so the fit
+// decision matches drawText() to the pixel.
+size_t TxtReaderActivity::wrapSourceLine(const std::string& line, std::vector<std::string>& outLines) const {
+  // Scratch vectors are bounded by the codepoints scanned per visual line
+  // (roughly 2x what fits, thanks to the galloping probe), not by line length.
+  std::vector<uint32_t> cps;     // decoded codepoints from the current scan start
+  std::vector<uint32_t> cpEnds;  // byte offset into `line` just past cps[i]
+  cps.reserve(96);
+  cpEnds.reserve(96);
+
+  const auto stripSoftHyphens = [](std::string& s) {
+    size_t p = 0;
+    while ((p = s.find("\xC2\xAD", p)) != std::string::npos) s.erase(p, 2);
+  };
+
+  // Measures line[startByte, endByte) as it would be drawn (soft hyphens stripped,
+  // optional visible hyphen appended).
+  const auto measure = [&](const size_t startByte, const size_t endByte, const bool appendHyphen) {
+    std::string s = line.substr(startByte, endByte - startByte);
+    stripSoftHyphens(s);
+    if (appendHyphen) s.push_back('-');
+    return renderer.getTextAdvanceX(cachedFontId, s.c_str(), EpdFontFamily::REGULAR);
+  };
+
+  const auto isWordSeparator = [](const uint32_t cp) { return cp == ' ' || utf8IsCjkBreakable(cp); };
+
+  size_t lineStart = 0;
+  while (lineStart < line.size() && static_cast<int>(outLines.size()) < linesPerPage) {
+    cps.clear();
+    cpEnds.clear();
+    const auto* base = reinterpret_cast<const unsigned char*>(line.c_str());
+    const unsigned char* decodePtr = base + lineStart;
+
+    // Decode until `count` codepoints are available (or the line ends).
+    const auto decodeTo = [&](const size_t count) {
+      while (cps.size() < count && *decodePtr) {
+        const uint32_t cp = utf8NextCodepoint(&decodePtr);
+        if (cp == 0) break;
+        cps.push_back(cp);
+        cpEnds.push_back(static_cast<uint32_t>(decodePtr - base));
+      }
+      return cps.size();
+    };
+
+    // Gallop then bisect for the largest codepoint-prefix that fits the viewport.
+    size_t fitCount = 0;  // codepoints known to fit
+    bool wholeLineFits = false;
+    for (size_t probe = 16;; probe *= 2) {
+      const size_t available = decodeTo(probe);
+      if (available == 0) {
+        // Malformed trailing UTF-8: emit the raw remainder to guarantee progress.
+        outLines.push_back(line.substr(lineStart));
+        return line.size();
+      }
+      if (measure(lineStart, cpEnds[available - 1], false) <= viewportWidth) {
+        fitCount = available;
+        if (available < probe) {  // line exhausted before overflow
+          wholeLineFits = true;
+          break;
+        }
+        continue;
+      }
+      size_t bad = available;  // smallest count known to overflow
+      while (bad - fitCount > 1) {
+        const size_t mid = fitCount + (bad - fitCount) / 2;
+        if (measure(lineStart, cpEnds[mid - 1], false) <= viewportWidth) {
+          fitCount = mid;
+        } else {
+          bad = mid;
+        }
+      }
+      break;
+    }
+
+    if (wholeLineFits) {
+      std::string rest = line.substr(lineStart);
+      stripSoftHyphens(rest);
+      outLines.push_back(std::move(rest));
+      return line.size();
+    }
+
+    if (fitCount == 0) {
+      // Even a single codepoint overflows: emit it alone to guarantee progress.
+      outLines.push_back(line.substr(lineStart, cpEnds[0] - lineStart));
+      lineStart = cpEnds[0];
+      continue;
+    }
+
+    // Rightmost legal break opportunity within the fitting prefix. A break
+    // before cps[i] emits [lineStart, emitEnd) and resumes at `resume`.
+    size_t emitEnd = 0;
+    size_t resume = 0;
+    bool hasBreak = false;
+    for (size_t i = 1; i <= fitCount; ++i) {  // cps[fitCount] exists: it overflowed
+      if (cps[i - 1] == ' ') {
+        // Trim the whole run of spaces from the line end; skip exactly one when resuming.
+        size_t j = i - 1;
+        while (j > 0 && cps[j - 1] == ' ') --j;
+        const size_t end = (j >= 1) ? cpEnds[j - 1] : lineStart;
+        if (end > lineStart) {
+          emitEnd = end;
+          resume = cpEnds[i - 1];
+          hasBreak = true;
+        }
+      } else if (utf8HasCjkBreakOpportunityBetween(cps[i - 1], cps[i])) {
+        emitEnd = cpEnds[i - 1];
+        resume = cpEnds[i - 1];
+        hasBreak = true;
+      }
+    }
+    if (cps[fitCount] == ' ') {
+      // The overflow codepoint is itself a space: the entire fitting prefix ends a
+      // word, so break right there and resume past the space.
+      size_t j = fitCount;
+      while (j > 0 && cps[j - 1] == ' ') --j;
+      if (j >= 1) {
+        emitEnd = cpEnds[j - 1];
+        resume = cpEnds[fitCount];
+        hasBreak = true;
+      }
+    }
+
+    bool emitted = false;
+    if (cachedHyphenationEnabled) {
+      // Word straddling the fit boundary: cps[fitCount] is the first codepoint
+      // that no longer fits; hyphenating its word can reclaim the slack that a
+      // break at the last separator would leave.
+      size_t wordStartIdx = fitCount;
+      while (wordStartIdx > 0 && !isWordSeparator(cps[wordStartIdx - 1])) --wordStartIdx;
+      if (wordStartIdx < fitCount && !isWordSeparator(cps[fitCount])) {
+        // Bounded forward scan for the word end (it may extend past the overflow point).
+        constexpr size_t MAX_WORD_SCAN_CPS = 64;
+        size_t wordEndIdx = fitCount;
+        while (wordEndIdx < wordStartIdx + MAX_WORD_SCAN_CPS && decodeTo(wordEndIdx + 1) > wordEndIdx &&
+               !isWordSeparator(cps[wordEndIdx])) {
+          ++wordEndIdx;
+        }
+        const size_t wordStartByte = (wordStartIdx > 0) ? cpEnds[wordStartIdx - 1] : lineStart;
+        const size_t wordEndByte = cpEnds[wordEndIdx - 1];
+        const std::string word = line.substr(wordStartByte, wordEndByte - wordStartByte);
+        // Fallback every-N splitting only when there is no other way to break the line.
+        const auto breaks = Hyphenator::breakOffsets(word, /*includeFallback=*/!hasBreak);
+        for (auto it = breaks.rbegin(); it != breaks.rend() && !emitted; ++it) {
+          const size_t candidateEnd = wordStartByte + it->byteOffset;
+          // Prefixes past the overflow codepoint cannot fit once the hyphen is added.
+          if (candidateEnd <= lineStart || candidateEnd > cpEnds[fitCount]) continue;
+          if (measure(lineStart, candidateEnd, it->requiresInsertedHyphen) <= viewportWidth) {
+            std::string cand = line.substr(lineStart, candidateEnd - lineStart);
+            stripSoftHyphens(cand);
+            if (it->requiresInsertedHyphen) cand.push_back('-');
+            outLines.push_back(std::move(cand));
+            lineStart = candidateEnd;
+            emitted = true;
+          }
+        }
+      }
+    }
+
+    if (!emitted) {
+      if (hasBreak) {
+        std::string out = line.substr(lineStart, emitEnd - lineStart);
+        stripSoftHyphens(out);
+        outLines.push_back(std::move(out));
+        lineStart = resume;
+      } else {
+        // No separator and no hyphenation point: hard break after the last fitting codepoint.
+        std::string out = line.substr(lineStart, cpEnds[fitCount - 1] - lineStart);
+        stripSoftHyphens(out);
+        outLines.push_back(std::move(out));
+        lineStart = cpEnds[fitCount - 1];
+      }
+    }
+  }
+  return lineStart;
 }
 
 void TxtReaderActivity::render(RenderLock&&) {
@@ -512,6 +660,7 @@ bool TxtReaderActivity::loadPageIndexCache() {
   // - int32_t: font ID (to invalidate cache on font change)
   // - int32_t: screen margin (to invalidate cache on margin change)
   // - uint8_t: paragraph alignment (to invalidate cache on alignment change)
+  // - uint8_t: hyphenation enabled (to invalidate cache on hyphenation toggle)
   // - uint32_t: total pages count
   // - N * uint32_t: page offsets
 
@@ -579,6 +728,13 @@ bool TxtReaderActivity::loadPageIndexCache() {
     return false;
   }
 
+  uint8_t hyphenation;
+  serialization::readPod(f, hyphenation);
+  if (hyphenation != cachedHyphenationEnabled) {
+    LOG_DBG("TRS", "Cache hyphenation mismatch, rebuilding");
+    return false;
+  }
+
   uint32_t numPages;
   serialization::readPod(f, numPages);
 
@@ -614,6 +770,7 @@ void TxtReaderActivity::savePageIndexCache() const {
   serialization::writePod(f, static_cast<int32_t>(cachedFontId));
   serialization::writePod(f, static_cast<int32_t>(cachedScreenMargin));
   serialization::writePod(f, cachedParagraphAlignment);
+  serialization::writePod(f, cachedHyphenationEnabled);
   serialization::writePod(f, static_cast<uint32_t>(pageOffsets.size()));
 
   // Write page offsets

@@ -33,6 +33,7 @@ class TxtReaderActivity final : public Activity {
   int cachedFontId = 0;
   uint8_t cachedScreenMargin = 0;
   uint8_t cachedParagraphAlignment = CrossPointSettings::LEFT_ALIGN;
+  uint8_t cachedHyphenationEnabled = 0;
   int cachedOrientedMarginTop = 0;
   int cachedOrientedMarginRight = 0;
   int cachedOrientedMarginBottom = 0;
@@ -43,6 +44,7 @@ class TxtReaderActivity final : public Activity {
 
   void initializeReader();
   bool loadPageAtOffset(size_t offset, std::vector<std::string>& outLines, size_t& nextOffset);
+  size_t wrapSourceLine(const std::string& line, std::vector<std::string>& outLines) const;
   bool buildPageIndex();  // false = aborted by user (Back during build)
   bool loadPageIndexCache();
   void savePageIndexCache() const;

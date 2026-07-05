@@ -44,6 +44,15 @@ inline bool utf8IsCjkBreakable(const uint32_t cp) {
          || (cp >= 0x2A700 && cp <= 0x2B73F);  // CJK Extension C
 }
 
+// CJK line-breaking prohibition (kinsoku) rules: closing punctuation must not
+// start a line, opening punctuation must not end a line.
+bool utf8IsNoBreakBeforeCjkPunctuation(uint32_t cp);
+bool utf8IsNoBreakAfterCjkPunctuation(uint32_t cp);
+// Returns true when a line break is allowed between two adjacent codepoints
+// under CJK implicit word-boundary rules (at least one side CJK-breakable,
+// kinsoku respected, never before a combining mark).
+bool utf8HasCjkBreakOpportunityBetween(uint32_t leftCp, uint32_t rightCp);
+
 // Returns true for Unicode combining diacritical marks that should not advance the cursor.
 inline bool utf8IsCombiningMark(const uint32_t cp) {
   return (cp >= 0x0300 && cp <= 0x036F)      // Combining Diacritical Marks

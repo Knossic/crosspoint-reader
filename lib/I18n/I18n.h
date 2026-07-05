@@ -24,6 +24,8 @@ class I18n {
   void setLanguage(Language lang);
   const char* getLanguageName(Language lang) const;
   static Language languageFromCode(const char* code);
+  // Returns the ISO 639-1 code for a UI language (e.g. "en"), or "en" if out of range.
+  static const char* getLanguageCode(Language lang);
 
   // Get all unique characters used in a specific language
   // Returns a sorted string of unique characters
