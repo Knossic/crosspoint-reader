@@ -100,6 +100,132 @@ void GfxRenderer::insertFont(const int fontId, EpdFontFamily font) {
   }
 }
 
+void GfxRenderer::setFallbackEligibleFonts(const int* ids, const size_t count) {
+  fallbackEligibleCount_ = count < MAX_FALLBACK_ELIGIBLE_FONTS ? count : MAX_FALLBACK_ELIGIBLE_FONTS;
+  for (size_t i = 0; i < fallbackEligibleCount_; i++) {
+    fallbackEligibleFonts_[i] = ids[i];
+  }
+}
+
+const EpdFontFamily* GfxRenderer::fallbackFamilyFor(const int fontId) const {
+  if (fallbackFontId_ == 0 || fontId == fallbackFontId_) return nullptr;
+  bool eligible = false;
+  for (size_t i = 0; i < fallbackEligibleCount_; i++) {
+    if (fallbackEligibleFonts_[i] == fontId) {
+      eligible = true;
+      break;
+    }
+  }
+  if (!eligible) return nullptr;
+  const auto it = fontMap.find(fallbackFontId_);
+  return it != fontMap.end() ? &it->second : nullptr;
+}
+
+bool GfxRenderer::prepareFallbackForText(const EpdFontFamily& primary, const char* text,
+                                         const EpdFontFamily::Style style, const bool forDrawing) const {
+  // Collect the UTF-8 bytes of codepoints the primary font lacks. Primary is
+  // always a built-in (RAM-resident) font here — SD fonts are never in the
+  // eligible list — so this scan does no I/O.
+  std::string missing;
+  const uint8_t* cursor = reinterpret_cast<const uint8_t*>(text);
+  uint32_t cp;
+  while (true) {
+    const uint8_t* runStart = cursor;
+    cp = utf8NextCodepoint(&cursor);
+    if (cp == 0) break;
+    if (utf8IsCombiningMark(cp)) continue;  // combining marks stay primary-only
+    if (primary.getGlyphOrNull(cp, style)) continue;
+    missing.append(reinterpret_cast<const char*>(runStart), static_cast<size_t>(cursor - runStart));
+  }
+  if (missing.empty()) return false;
+
+  const auto sdIt = sdCardFonts_.find(fallbackFontId_);
+  if (sdIt == sdCardFonts_.end()) return true;  // built-in fallback: glyphs already RAM-resident
+  SdCardFont* sdFont = sdIt->second;
+  const uint8_t styleIdx = sdFont->resolveStyle(static_cast<uint8_t>(style) & 0x03);
+  const uint8_t styleBit = static_cast<uint8_t>(1u << styleIdx);
+
+  if (!forDrawing) {
+    // Measurement: merge advance metrics into the persistent advance table.
+    // Skip the batch build (it heap-allocates a staging buffer per call) when
+    // every missing codepoint already has an entry — the common case inside
+    // truncatedText()'s repeated measurement loop.
+    const uint8_t* q = reinterpret_cast<const uint8_t*>(missing.c_str());
+    while ((cp = utf8NextCodepoint(&q)) != 0) {
+      if (sdFont->getAdvance(cp, styleIdx) == 0) {
+        sdFont->buildAdvanceTable(missing.c_str(), styleBit);
+        break;
+      }
+    }
+    return true;
+  }
+
+  // Drawing: batch-prewarm bitmaps unless everything is already resident.
+  // Without this, each missing glyph would open the .cpfont file individually
+  // through the small on-demand overflow ring.
+  const uint8_t* p = reinterpret_cast<const uint8_t*>(missing.c_str());
+  while ((cp = utf8NextCodepoint(&p)) != 0) {
+    if (!sdFont->isGlyphResident(cp, styleIdx)) {
+      sdFont->prewarm(missing.c_str(), styleBit);
+      break;
+    }
+  }
+  return true;
+}
+
+int GfxRenderer::textWidthWithFallback(const EpdFontFamily& primary, const EpdFontFamily& fallback, const char* text,
+                                       const EpdFontFamily::Style style) const {
+  SdCardFont* sdFallback = nullptr;
+  uint8_t sdStyleIdx = 0;
+  const auto sdIt = sdCardFonts_.find(fallbackFontId_);
+  if (sdIt != sdCardFonts_.end()) {
+    sdFallback = sdIt->second;
+    sdStyleIdx = sdFallback->resolveStyle(static_cast<uint8_t>(style) & 0x03);
+  }
+
+  const bool isSupSub = (style & (EpdFontFamily::SUP | EpdFontFamily::SUB)) != 0;
+  uint32_t cp;
+  uint32_t prevCp = 0;
+  bool prevFromPrimary = true;
+  int widthPx = 0;
+  int32_t prevAdvanceFP = 0;  // 12.4 fixed-point: differential rounding matches drawText
+  while ((cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&text)))) {
+    if (utf8IsCombiningMark(cp)) continue;
+    cp = primary.applyLigatures(cp, text, style);
+
+    bool fromPrimary = true;
+    int32_t advanceFP = 0;
+    const EpdGlyph* glyph = primary.getGlyphOrNull(cp, style);
+    if (glyph) {
+      advanceFP = glyph->advanceX;
+    } else {
+      fromPrimary = false;
+      if (sdFallback) advanceFP = sdFallback->getAdvance(cp, sdStyleIdx);
+      if (advanceFP == 0) {
+        const EpdGlyph* fbGlyph = fallback.getGlyphOrNull(cp, style);
+        if (fbGlyph) advanceFP = fbGlyph->advanceX;
+      }
+      if (advanceFP == 0) {
+        // Neither font covers it: replacement glyph from the primary,
+        // matching what drawText will render.
+        const EpdGlyph* rep = primary.getGlyph(cp, style);
+        advanceFP = rep ? rep->advanceX : 0;
+        fromPrimary = true;
+      }
+    }
+
+    if (prevCp != 0) {
+      const int32_t kernFP = (fromPrimary && prevFromPrimary) ? primary.getKerning(prevCp, cp, style) : 0;
+      widthPx += fp4::toPixel(prevAdvanceFP + kernFP);
+    }
+    prevAdvanceFP = isSupSub ? (advanceFP + 1) / 2 : advanceFP;
+    prevCp = cp;
+    prevFromPrimary = fromPrimary;
+  }
+  widthPx += fp4::toPixel(prevAdvanceFP);
+  return widthPx;
+}
+
 // Translate logical (x,y) coordinates to physical panel coordinates based on current orientation
 // This should always be inlined for better performance
 static inline void rotateCoordinates(const GfxRenderer::Orientation orientation, const int x, const int y, int* phyX,
@@ -374,6 +500,11 @@ int GfxRenderer::getTextWidth(const int fontId, const char* text, const EpdFontF
   std::string visual;
   const char* renderedText = resolveVisualText(text, visual, baseDir);
 
+  const EpdFontFamily* fallback = fallbackFamilyFor(fontId);
+  if (fallback && prepareFallbackForText(fontIt->second, renderedText, style, false)) {
+    return textWidthWithFallback(fontIt->second, *fallback, renderedText, style);
+  }
+
   int w = 0, h = 0;
   fontIt->second.getTextDimensions(renderedText, &w, &h, style);
   return w;
@@ -414,9 +545,15 @@ void GfxRenderer::drawText(const int fontId, const int x, const int y, const cha
   }
   const auto& font = fontIt->second;
 
+  const EpdFontFamily* fbFamily = fallbackFamilyFor(fontId);
+  if (fbFamily && !prepareFallbackForText(font, renderedText, style, true)) {
+    fbFamily = nullptr;  // nothing missing — take the primary-only path
+  }
+
   const char* textCursor = renderedText;
   uint32_t cp;
   uint32_t prevCp = 0;
+  bool prevFromPrimary = true;
   while ((cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&textCursor)))) {
     // Skip Hebrew Niqqud (vowel marks)
     // Temporary: avoid adding Niqqud to built-in fonts. Remove when custom fonts are supported.
@@ -436,15 +573,31 @@ void GfxRenderer::drawText(const int fontId, const int x, const int y, const cha
 
     cp = font.applyLigatures(cp, textCursor, style);
 
-    // Differential rounding: snap (previous advance + current kern) as one unit so
-    // identical character pairs always produce the same pixel step regardless of
-    // where they fall on the line.
-    if (prevCp != 0) {
-      const auto kernFP = font.getKerning(prevCp, cp, style);  // 4.4 fixed-point kern
-      lastBaseX += fp4::toPixel(prevAdvanceFP + kernFP);       // snap 12.4 fixed-point to nearest pixel
+    const EpdFontFamily* glyphFamily = &font;
+    const EpdGlyph* glyph;
+    if (fbFamily) {
+      glyph = font.getGlyphOrNull(cp, style);
+      if (!glyph) {
+        const EpdGlyph* fbGlyph = fbFamily->getGlyphOrNull(cp, style);
+        if (fbGlyph) {
+          glyph = fbGlyph;
+          glyphFamily = fbFamily;
+        } else {
+          glyph = font.getGlyph(cp, style);  // replacement glyph
+        }
+      }
+    } else {
+      glyph = font.getGlyph(cp, style);
     }
 
-    const EpdGlyph* glyph = font.getGlyph(cp, style);
+    // Differential rounding: snap (previous advance + current kern) as one unit so
+    // identical character pairs always produce the same pixel step regardless of
+    // where they fall on the line. No kerning across the primary/fallback boundary.
+    if (prevCp != 0) {
+      const auto kernFP = (glyphFamily == &font && prevFromPrimary) ? font.getKerning(prevCp, cp, style)
+                                                                    : static_cast<int8_t>(0);  // 4.4 fixed-point kern
+      lastBaseX += fp4::toPixel(prevAdvanceFP + kernFP);  // snap 12.4 fixed-point to nearest pixel
+    }
 
     lastBaseLeft = glyph ? glyph->left : 0;
     lastBaseWidth = glyph ? glyph->width : 0;
@@ -460,11 +613,12 @@ void GfxRenderer::drawText(const int fontId, const int x, const int y, const cha
 
     if (isSupSub) {
       // yPos already carries the vertical offset applied by TextBlock::render().
-      renderCharScaled(*this, renderMode, font, cp, lastBaseX, yPos, black, style);
+      renderCharScaled(*this, renderMode, *glyphFamily, cp, lastBaseX, yPos, black, style);
     } else {
-      renderCharImpl<TextRotation::None>(*this, renderMode, font, cp, lastBaseX, yPos, black, style);
+      renderCharImpl<TextRotation::None>(*this, renderMode, *glyphFamily, cp, lastBaseX, yPos, black, style);
     }
     prevCp = cp;
+    prevFromPrimary = (glyphFamily == &font);
   }
 }
 
@@ -1719,6 +1873,14 @@ void GfxRenderer::drawTextRotated90CW(const int fontId, const int x, const int y
 
   const auto& font = fontIt->second;
 
+  const EpdFontFamily* fbFamily = fallbackFamilyFor(fontId);
+  if (fbFamily && !prepareFallbackForText(font, text, style, true)) {
+    fbFamily = nullptr;  // nothing missing — take the primary-only path
+  }
+  // Rotated rendering positions glyphs off the family's ascender, so shift the
+  // fallback's pen origin to keep both fonts on the primary's baseline.
+  const int fbAscenderDelta = fbFamily ? (font.getData(style)->ascender - fbFamily->getData(style)->ascender) : 0;
+
   int lastBaseY = y;
   int lastBaseLeft = 0;
   int lastBaseWidth = 0;
@@ -1727,6 +1889,7 @@ void GfxRenderer::drawTextRotated90CW(const int fontId, const int x, const int y
 
   uint32_t cp;
   uint32_t prevCp = 0;
+  bool prevFromPrimary = true;
   while ((cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&text)))) {
     // Skip Hebrew Niqqud (vowel marks)
     // Temporary: avoid adding Niqqud to built-in fonts. Remove when custom fonts are supported.
@@ -1747,22 +1910,41 @@ void GfxRenderer::drawTextRotated90CW(const int fontId, const int x, const int y
 
     cp = font.applyLigatures(cp, text, style);
 
-    // Differential rounding: snap (previous advance + current kern) as one unit,
-    // subtracting for the rotated coordinate direction.
-    if (prevCp != 0) {
-      const auto kernFP = font.getKerning(prevCp, cp, style);  // 4.4 fixed-point kern
-      lastBaseY -= fp4::toPixel(prevAdvanceFP + kernFP);       // snap 12.4 fixed-point to nearest pixel
+    const EpdFontFamily* glyphFamily = &font;
+    const EpdGlyph* glyph;
+    if (fbFamily) {
+      glyph = font.getGlyphOrNull(cp, style);
+      if (!glyph) {
+        const EpdGlyph* fbGlyph = fbFamily->getGlyphOrNull(cp, style);
+        if (fbGlyph) {
+          glyph = fbGlyph;
+          glyphFamily = fbFamily;
+        } else {
+          glyph = font.getGlyph(cp, style);  // replacement glyph
+        }
+      }
+    } else {
+      glyph = font.getGlyph(cp, style);
     }
 
-    const EpdGlyph* glyph = font.getGlyph(cp, style);
+    // Differential rounding: snap (previous advance + current kern) as one unit,
+    // subtracting for the rotated coordinate direction. No kerning across the
+    // primary/fallback boundary.
+    if (prevCp != 0) {
+      const auto kernFP = (glyphFamily == &font && prevFromPrimary) ? font.getKerning(prevCp, cp, style)
+                                                                    : static_cast<int8_t>(0);  // 4.4 fixed-point kern
+      lastBaseY -= fp4::toPixel(prevAdvanceFP + kernFP);  // snap 12.4 fixed-point to nearest pixel
+    }
 
     lastBaseLeft = glyph ? glyph->left : 0;
     lastBaseWidth = glyph ? glyph->width : 0;
     lastBaseTop = glyph ? glyph->top : 0;
     prevAdvanceFP = glyph ? glyph->advanceX : 0;  // 12.4 fixed-point
 
-    renderCharImpl<TextRotation::Rotated90CW>(*this, renderMode, font, cp, x, lastBaseY, black, style);
+    const int glyphX = (glyphFamily == fbFamily) ? x + fbAscenderDelta : x;
+    renderCharImpl<TextRotation::Rotated90CW>(*this, renderMode, *glyphFamily, cp, glyphX, lastBaseY, black, style);
     prevCp = cp;
+    prevFromPrimary = (glyphFamily == &font);
   }
 }
 

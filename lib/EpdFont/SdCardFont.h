@@ -58,6 +58,11 @@ class SdCardFont {
   // Returns true if advance table is populated for at least one style.
   bool hasAdvanceTable() const;
 
+  // Returns true if the glyph for a codepoint is already loadable without SD
+  // I/O: present in the prewarmed mini cache or the on-demand overflow ring.
+  // Used by the renderer's fallback path to decide whether a prewarm is needed.
+  bool isGlyphResident(uint32_t codepoint, uint8_t styleIdx) const;
+
   // Free mini data for all styles and restore stub EpdFontData.
   // Preserves the persistent advance cache so repeated layout passes can reuse
   // previously fetched metrics.

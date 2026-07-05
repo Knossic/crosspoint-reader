@@ -62,6 +62,31 @@ class GfxRenderer {
   // as before, concentrated in a single pointer instead of four fields.
   mutable FontCacheManager* fontCacheManager_ = nullptr;
 
+  // Fallback font consulted when an eligible primary font lacks a glyph
+  // (e.g. CJK book titles drawn with the built-in Latin UI fonts). 0 = none.
+  // Only font IDs registered via setFallbackEligibleFonts() consult it:
+  // reader-body fonts must NOT, because reader layout measures words via
+  // getTextAdvanceX()/section caches and drawing different glyphs than were
+  // measured would corrupt the cached page layout.
+  int fallbackFontId_ = 0;
+  static constexpr size_t MAX_FALLBACK_ELIGIBLE_FONTS = 8;
+  int fallbackEligibleFonts_[MAX_FALLBACK_ELIGIBLE_FONTS] = {};
+  size_t fallbackEligibleCount_ = 0;
+
+  // Returns the fallback family for this primary font, or nullptr when the
+  // fallback is inactive or fontId is not eligible.
+  const EpdFontFamily* fallbackFamilyFor(int fontId) const;
+  // Scans text for codepoints the primary family lacks; returns true if any.
+  // For an SD-resident fallback, batch-loads what the caller needs:
+  // forDrawing=false merges advance metrics into the persistent advance table
+  // (measurement), forDrawing=true prewarms glyph bitmaps into the mini cache.
+  bool prepareFallbackForText(const EpdFontFamily& primary, const char* text, EpdFontFamily::Style style,
+                              bool forDrawing) const;
+  // Advance-sum width for text containing fallback glyphs. Kerning is applied
+  // only between consecutive primary-font glyphs.
+  int textWidthWithFallback(const EpdFontFamily& primary, const EpdFontFamily& fallback, const char* text,
+                            EpdFontFamily::Style style) const;
+
   // Tiled grayscale strip target. When active, drawPixel()/clearScreen()
   // operate on a caller-owned scratch holding one horizontal band of physical
   // rows [_stripY0, _stripY0 + _stripRows) (panelWidthBytes wide) instead of
@@ -117,6 +142,13 @@ class GfxRenderer {
   void clearSdCardFonts() { sdCardFonts_.clear(); }
   const std::map<int, SdCardFont*>& getSdCardFonts() const { return sdCardFonts_; }
   bool isSdCardFont(int fontId) const { return sdCardFonts_.count(fontId) > 0; }
+  // UI glyph fallback: font consulted when an eligible primary font lacks a
+  // glyph. 0 disables. The fallback font must already be registered via
+  // insertFont() (and registerSdCardFont() for SD fonts).
+  void setFallbackFontId(int id) { fallbackFontId_ = id; }
+  int getFallbackFontId() const { return fallbackFontId_; }
+  // Restrict fallback to these primary font IDs (UI chrome fonts only).
+  void setFallbackEligibleFonts(const int* ids, size_t count);
   // Ensure SD card font glyph data is loaded for the given text. Called from layout code
   // (which holds a const GfxRenderer&) before measuring word widths. Safe to call on non-SD fonts (no-op).
   // styleMask: bitmask of styles to prepare (bit 0=regular, 1=bold, 2=italic, 3=bold-italic).

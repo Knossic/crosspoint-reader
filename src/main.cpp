@@ -296,6 +296,12 @@ void setupDisplayAndFonts(bool seamless = false) {
   renderer.insertFont(UI_12_FONT_ID, ui12FontFamily);
   renderer.insertFont(SMALL_FONT_ID, smallFontFamily);
 
+  // UI chrome fonts may borrow missing glyphs (e.g. CJK titles) from the SD
+  // fallback font. Reader-body fonts must not: their layout is measured via
+  // getTextAdvanceX/section caches without fallback awareness.
+  static constexpr int kFallbackEligibleFonts[] = {UI_10_FONT_ID, UI_12_FONT_ID, SMALL_FONT_ID};
+  renderer.setFallbackEligibleFonts(kFallbackEligibleFonts, 3);
+
   // Discover and load SD card fonts
   sdFontSystem.begin(renderer);
 

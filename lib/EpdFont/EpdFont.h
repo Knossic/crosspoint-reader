@@ -12,6 +12,11 @@ class EpdFont {
 
   const EpdGlyph* getGlyph(uint32_t cp) const;
 
+  /// Like getGlyph() but returns nullptr on a miss instead of substituting the
+  /// replacement glyph, so callers can distinguish "not covered" (e.g. to try
+  /// a fallback font). Still attempts on-demand loading via glyphMissHandler.
+  const EpdGlyph* getGlyphOrNull(uint32_t cp) const;
+
   /// Returns the kerning adjustment (4.4 fixed-point in pixels) between two codepoints.
   /// Returns 0 if no kerning data exists for the pair.
   int8_t getKerning(uint32_t leftCp, uint32_t rightCp) const;

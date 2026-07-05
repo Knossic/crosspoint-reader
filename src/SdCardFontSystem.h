@@ -1,9 +1,12 @@
 #pragma once
 
+#include <SdCardFont.h>
 #include <SdCardFontManager.h>
 #include <SdCardFontRegistry.h>
 
 #include <atomic>
+#include <memory>
+#include <string>
 
 class GfxRenderer;
 
@@ -46,9 +49,25 @@ class SdCardFontSystem {
   }
 
  private:
+  /// Reader-font part of ensureLoaded() (family/size selection + reload).
+  void ensureReaderFontLoaded(GfxRenderer& renderer);
+
+  /// Keep the UI glyph-fallback font in sync with the registry and settings:
+  /// a small-size instance of an SD family registered via
+  /// GfxRenderer::setFallbackFontId() so CJK titles render in UI chrome.
+  void syncUiFallback(GfxRenderer& renderer);
+  void unloadUiFallback(GfxRenderer& renderer);
+
   SdCardFontRegistry registry_;
   SdCardFontManager manager_;
   std::atomic<bool> registryDirty_{false};
+
+  // UI fallback font instance (separate from the reader font so reader
+  // reloads don't invalidate UI rendering state).
+  std::unique_ptr<SdCardFont> uiFallbackFont_;
+  int uiFallbackFontId_ = 0;
+  std::string uiFallbackFamilyName_;
+  uint8_t uiFallbackPointSize_ = 0;
 };
 
 // Global SD card font system instance (defined in main.cpp).

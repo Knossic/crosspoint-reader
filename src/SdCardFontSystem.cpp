@@ -1,7 +1,12 @@
 #include "SdCardFontSystem.h"
 
+#include <Arduino.h>
+#include <EpdFontFamily.h>
 #include <GfxRenderer.h>
 #include <Logging.h>
+#include <Memory.h>
+
+#include <algorithm>
 
 #include "CrossPointSettings.h"
 
@@ -43,10 +48,17 @@ void SdCardFontSystem::begin(GfxRenderer& renderer) {
     }
   }
 
+  syncUiFallback(renderer);
+
   LOG_DBG("SDFS", "SD font system ready (%d families discovered)", registry_.getFamilyCount());
 }
 
 void SdCardFontSystem::ensureLoaded(GfxRenderer& renderer) {
+  ensureReaderFontLoaded(renderer);
+  syncUiFallback(renderer);
+}
+
+void SdCardFontSystem::ensureReaderFontLoaded(GfxRenderer& renderer) {
   // If the web server (or another task) installed/deleted fonts, re-discover.
   // Track whether we just re-discovered so we can force a reload below even
   // when the wanted family/size still maps to the same point size — the file
@@ -113,4 +125,82 @@ int SdCardFontSystem::resolveFontId(const char* familyName, uint8_t /*fontSizeEn
   // enum is implicit — always return the single loaded font ID for this family.
   // ensureLoaded() must have been called with the current settings before this.
   return manager_.getFontId(familyName);
+}
+
+void SdCardFontSystem::unloadUiFallback(GfxRenderer& renderer) {
+  if (!uiFallbackFont_) return;
+  if (renderer.getFallbackFontId() == uiFallbackFontId_) {
+    renderer.setFallbackFontId(0);
+  }
+  renderer.removeFont(uiFallbackFontId_);
+  uiFallbackFont_.reset();
+  uiFallbackFontId_ = 0;
+  uiFallbackFamilyName_.clear();
+  uiFallbackPointSize_ = 0;
+}
+
+void SdCardFontSystem::syncUiFallback(GfxRenderer& renderer) {
+  // Family policy: the user's selected reader family when set, otherwise the
+  // first discovered family. No SD families installed -> no fallback (UI
+  // behaves exactly as before: missing glyphs render as the replacement box).
+  const SdCardFontFamilyInfo* family = nullptr;
+  if (SETTINGS.sdFontFamilyName[0] != '\0') {
+    family = registry_.findFamily(SETTINGS.sdFontFamilyName);
+  }
+  if (!family && registry_.getFamilyCount() > 0) {
+    family = &registry_.getFamilies().front();
+  }
+  if (!family || family->files.empty()) {
+    unloadUiFallback(renderer);
+    return;
+  }
+
+  // Smallest available size: UI chrome fonts are 10-12pt, and one size keeps
+  // the resident interval tables + glyph caches to a single font's worth.
+  const SdCardFontFileInfo* selected = &*std::min_element(
+      family->files.begin(), family->files.end(),
+      [](const SdCardFontFileInfo& a, const SdCardFontFileInfo& b) { return a.pointSize < b.pointSize; });
+
+  // Still loaded and still registered? Reader font reloads wipe all SD font
+  // registrations in the renderer (clearSdCardFonts), so re-check both sides.
+  if (uiFallbackFont_ && uiFallbackFamilyName_ == family->name && uiFallbackPointSize_ == selected->pointSize &&
+      renderer.isSdCardFont(uiFallbackFontId_) && renderer.getFallbackFontId() == uiFallbackFontId_) {
+    return;
+  }
+
+  unloadUiFallback(renderer);
+
+  const uint32_t heapBefore = ESP.getFreeHeap();
+  auto font = makeUniqueNoThrow<SdCardFont>();
+  if (!font) {
+    LOG_ERR("SDFS", "OOM: UI fallback SdCardFont");
+    return;
+  }
+  if (!font->load(selected->path.c_str())) {
+    LOG_ERR("SDFS", "UI fallback load failed: %s", selected->path.c_str());
+    return;
+  }
+
+  // Decorated name gives an ID distinct from a reader instance of the same
+  // file (\x01 cannot appear in a directory-derived family name).
+  char decorated[80];
+  snprintf(decorated, sizeof(decorated), "%s\x01ui", family->name.c_str());
+  const int fontId = SdCardFontManager::computeFontId(font->contentHash(), decorated, selected->pointSize);
+  if (renderer.getFontMap().count(fontId) != 0) {
+    LOG_ERR("SDFS", "UI fallback font ID %d collides with existing font, skipping", fontId);
+    return;
+  }
+
+  renderer.registerSdCardFont(fontId, font.get());
+  renderer.insertFont(
+      fontId, EpdFontFamily(font->getEpdFont(0), font->getEpdFont(1), font->getEpdFont(2), font->getEpdFont(3)));
+  renderer.setFallbackFontId(fontId);
+
+  uiFallbackFont_ = std::move(font);
+  uiFallbackFontId_ = fontId;
+  uiFallbackFamilyName_ = family->name;
+  uiFallbackPointSize_ = selected->pointSize;
+  LOG_DBG("SDFS", "UI fallback loaded: %s %upt id=%d heap %lu -> %lu", uiFallbackFamilyName_.c_str(),
+          uiFallbackPointSize_, uiFallbackFontId_, static_cast<unsigned long>(heapBefore),
+          static_cast<unsigned long>(ESP.getFreeHeap()));
 }

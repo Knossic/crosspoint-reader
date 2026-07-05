@@ -36,13 +36,17 @@ class SdCardFontManager {
   // 0 if nothing loaded.
   uint8_t currentPointSize() const { return loadedPointSize_; };
 
+  // Deterministic font ID from content hash + family name + point size.
+  // Public so SdCardFontSystem can derive a distinct ID for the UI fallback
+  // instance (same scheme, decorated family name).
+  static int computeFontId(uint32_t contentHash, const char* familyName, uint8_t pointSize);
+
  private:
   struct LoadedFont {
     SdCardFont* font;  // heap-allocated, owned
     int fontId;
     uint8_t size;
   };
-  static int computeFontId(uint32_t contentHash, const char* familyName, uint8_t pointSize);
 
   std::string loadedFamilyName_;
   uint8_t loadedPointSize_ = 0;

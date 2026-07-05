@@ -1068,6 +1068,32 @@ bool SdCardFont::hasAdvanceTable() const {
   return false;
 }
 
+bool SdCardFont::isGlyphResident(uint32_t codepoint, uint8_t styleIdx) const {
+  styleIdx &= (MAX_STYLES - 1);
+  const auto& s = styles_[styleIdx];
+  if (!s.present) return false;
+
+  // Mini cache (stubData has intervalCount 0, so this is a no-op when cold)
+  const EpdFontData* d = s.epdFont.data;
+  const EpdUnicodeInterval* intervals = d->intervals;
+  uint32_t lo = 0, hi = d->intervalCount;
+  while (lo < hi) {
+    const uint32_t mid = lo + (hi - lo) / 2;
+    if (intervals[mid].last < codepoint) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  if (lo < d->intervalCount && intervals[lo].first <= codepoint) return true;
+
+  // On-demand overflow ring
+  for (uint32_t i = 0; i < overflowCount_; i++) {
+    if (overflow_[i].codepoint == codepoint && overflow_[i].styleIdx == styleIdx) return true;
+  }
+  return false;
+}
+
 uint16_t SdCardFont::getAdvance(uint32_t codepoint, uint8_t style) const {
   style &= (MAX_STYLES - 1);
   if (!advanceTable_[style]) return 0;
