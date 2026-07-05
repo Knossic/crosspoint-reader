@@ -211,7 +211,7 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
                                 const uint8_t paragraphAlignment, const uint16_t viewportWidth,
                                 const uint16_t viewportHeight, const bool hyphenationEnabled, const bool embeddedStyle,
                                 const uint8_t imageRendering, const bool focusReadingEnabled,
-                                const std::function<void()>& popupFn) {
+                                const std::function<void(int)>& popupFn) {
   // One-shot build: start, then lay out the whole section in a single pass.
   if (!startBuild(fontId, lineCompression, extraParagraphSpacing, paragraphAlignment, viewportWidth, viewportHeight,
                   hyphenationEnabled, embeddedStyle, imageRendering, focusReadingEnabled, popupFn)) {
@@ -226,7 +226,7 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
 bool Section::startBuild(const int fontId, const float lineCompression, const bool extraParagraphSpacing,
                          const uint8_t paragraphAlignment, const uint16_t viewportWidth, const uint16_t viewportHeight,
                          const bool hyphenationEnabled, const bool embeddedStyle, const uint8_t imageRendering,
-                         const bool focusReadingEnabled, const std::function<void()>& popupFn) {
+                         const bool focusReadingEnabled, const std::function<void(int)>& popupFn) {
   if (build_) {
     LOG_ERR("SCT", "startBuild called while a build is already active");
     return false;
@@ -378,7 +378,7 @@ bool Section::startBuild(const int fontId, const float lineCompression, const bo
       [this, ctxPtr](std::unique_ptr<Page> page, const uint16_t paragraphIndex, const uint16_t listItemIndex) {
         ctxPtr->lut.push_back({this->onPageComplete(std::move(page)), paragraphIndex, listItemIndex});
       },
-      embeddedStyle, ctxPtr->contentBase, ctxPtr->imageBasePath, imageRendering, std::move(tocAnchors), popupFn,
+      embeddedStyle, ctxPtr->contentBase, ctxPtr->imageBasePath, imageRendering, std::move(tocAnchors),
       ctxPtr->cssParser);
   if (!ctx->parser) {
     LOG_ERR("SCT", "OOM: ChapterHtmlSlimParser");
@@ -398,6 +398,16 @@ bool Section::startBuild(const int fontId, const float lineCompression, const bo
     return false;
   }
   build_->totalBytes = build_->parser->parseTotalBytes();
+
+  // Blocking-build progress popup. Small chapters build in a blink and don't
+  // benefit from it (same 10KB threshold the parser used before the popup
+  // moved here from ChapterHtmlSlimParser::beginParse).
+  static constexpr uint32_t MIN_SIZE_FOR_POPUP = 10 * 1024;
+  if (popupFn && build_->totalBytes >= MIN_SIZE_FOR_POPUP) {
+    build_->popupFn = popupFn;
+    build_->lastPopupMs = millis();
+    build_->popupFn(0);
+  }
   return true;
 }
 
@@ -419,6 +429,15 @@ bool Section::buildSomeMore(const int maxPages) {
     }
     if (status == ChapterHtmlSlimParser::ParseStatus::Done) {
       return finalizeBuild();
+    }
+    if (build_->popupFn && build_->totalBytes > 0) {
+      const int pct =
+          static_cast<int>(static_cast<uint64_t>(build_->parser->parseBytesConsumed()) * 100 / build_->totalBytes);
+      if (pct >= build_->lastPopupPct + 5 && millis() - build_->lastPopupMs >= 2000) {
+        build_->popupFn(pct);
+        build_->lastPopupPct = pct;
+        build_->lastPopupMs = millis();
+      }
     }
     // ParseStatus::More: yield once we've laid out the requested number of pages.
     if (maxPages > 0 && (builtPageCount_ - startCount) >= maxPages) {

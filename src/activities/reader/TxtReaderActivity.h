@@ -2,6 +2,7 @@
 
 #include <Txt.h>
 
+#include <atomic>
 #include <vector>
 
 #include "CrossPointSettings.h"
@@ -21,6 +22,13 @@ class TxtReaderActivity final : public Activity {
   int viewportWidth = 0;
   bool initialized = false;
 
+  // Page-index build runs on the render task while loop() keeps running on
+  // the main task; these flags are the only state shared across that boundary
+  // (single writer each, so atomics suffice — no mutex needed).
+  std::atomic<bool> indexBuilding_{false};        // written by render task
+  std::atomic<bool> indexAbortRequested_{false};  // written by main task
+  std::atomic<bool> indexAborted_{false};         // written by render task
+
   // Cached settings for cache validation (different fonts/margins require re-indexing)
   int cachedFontId = 0;
   uint8_t cachedScreenMargin = 0;
@@ -35,7 +43,7 @@ class TxtReaderActivity final : public Activity {
 
   void initializeReader();
   bool loadPageAtOffset(size_t offset, std::vector<std::string>& outLines, size_t& nextOffset);
-  void buildPageIndex();
+  bool buildPageIndex();  // false = aborted by user (Back during build)
   bool loadPageIndexCache();
   void savePageIndexCache() const;
   void saveProgress() const;

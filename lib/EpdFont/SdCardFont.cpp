@@ -1028,16 +1028,17 @@ bool SdCardFont::advanceTableLookup(uint8_t styleIdx, uint32_t codepoint, uint16
   return false;
 }
 
-void SdCardFont::mergeIntoAdvanceTable(uint8_t styleIdx, const AdvanceEntry* sortedNew, uint32_t newCount) {
+void SdCardFont::mergeIntoAdvanceTable(uint8_t styleIdx, const AdvanceEntry* sortedNew, uint32_t newCount,
+                                       uint32_t cap) {
   if (newCount == 0) return;
   const uint32_t oldSize = advanceTableSize_[styleIdx];
-  if (oldSize >= ADVANCE_CACHE_LIMIT) return;  // already full
+  if (oldSize >= cap) return;  // already full
 
-  // Cap the merged size at ADVANCE_CACHE_LIMIT. Anything past the cap is
-  // dropped from the tail of the sorted merge — a deterministic, bounded loss
-  // that doesn't bias which codepoints get cached on subsequent passes.
+  // Cap the merged size. Anything past the cap is dropped from the tail of
+  // the sorted merge — a deterministic, bounded loss that doesn't bias which
+  // codepoints get cached on subsequent passes.
   uint32_t mergedCap = oldSize + newCount;
-  if (mergedCap > ADVANCE_CACHE_LIMIT) mergedCap = ADVANCE_CACHE_LIMIT;
+  if (mergedCap > cap) mergedCap = cap;
 
   AdvanceEntry* merged = new (std::nothrow) AdvanceEntry[mergedCap];
   if (!merged) {
@@ -1059,6 +1060,35 @@ void SdCardFont::mergeIntoAdvanceTable(uint8_t styleIdx, const AdvanceEntry* sor
   delete[] advanceTable_[styleIdx];
   advanceTable_[styleIdx] = merged;
   advanceTableSize_[styleIdx] = k;
+}
+
+void SdCardFont::compactAdvanceTable(uint8_t styleIdx, const uint32_t* sortedCps, uint32_t cpCount) {
+  AdvanceEntry* table = advanceTable_[styleIdx];
+  const uint32_t size = advanceTableSize_[styleIdx];
+  if (!table || size == 0) return;
+
+  uint32_t kept = 0;
+  for (uint32_t i = 0; i < size; i++) {
+    const uint32_t cp = table[i].codepoint;
+    // Binary search membership in the current working set.
+    uint32_t lo = 0, hi = cpCount;
+    while (lo < hi) {
+      const uint32_t mid = lo + (hi - lo) / 2;
+      if (sortedCps[mid] < cp) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    if (lo < cpCount && sortedCps[lo] == cp) {
+      table[kept++] = table[i];  // in-place, preserves sort order
+    }
+  }
+  if (kept != size) {
+    LOG_DBG("SDCF", "Advance table style %u: evicted %u stale entries (%u kept)", styleIdx, size - kept, kept);
+  }
+  advanceTableSize_[styleIdx] = kept;
+  // Keep the existing allocation; the following merge replaces it anyway.
 }
 
 bool SdCardFont::hasAdvanceTable() const {
@@ -1124,11 +1154,6 @@ int SdCardFont::fetchAdvancesForCodepoints(uint32_t* codepoints, uint32_t cpCoun
     if (!(styleMask & (1 << si)) || !styles_[si].present) continue;
     const auto& s = styles_[si];
 
-    // Stop fetching once the cache is full — further inserts would be dropped
-    // by the merge anyway. The renderer fast path tolerates missing entries
-    // (returns 0); the slow path is still correct for those codepoints.
-    if (advanceTableSize_[si] >= ADVANCE_CACHE_LIMIT) continue;
-
     // For each codepoint in `codepoints`, skip those already cached, then
     // resolve to a glyph index. Build a parallel array sorted by glyph index
     // for sequential SD reads.
@@ -1164,6 +1189,21 @@ int SdCardFont::fetchAdvancesForCodepoints(uint32_t* codepoints, uint32_t cpCoun
     totalMissed += static_cast<int>(missedThisStyle);
 
     if (needCount == 0) continue;
+
+    // The current text must be fully covered or the renderer's slow path
+    // falls back to per-glyph SD loads through the 8-slot overflow ring —
+    // quadratic thrash for CJK text (>768 unique codepoints per book is
+    // routine). If the missing entries don't fit under the steady-state cap,
+    // evict entries outside the current working set, and let this call's
+    // table grow to the working-set size when the text alone exceeds the cap.
+    // `codepoints` is sorted and unique (see buildAdvanceTableRange).
+    uint32_t cap = ADVANCE_CACHE_LIMIT;
+    if (advanceTableSize_[si] + needCount > cap) {
+      compactAdvanceTable(si, codepoints, cpCount);
+      if (advanceTableSize_[si] + needCount > cap) {
+        cap = advanceTableSize_[si] + needCount;  // bounded by MAX_UNIQUE_CODEPOINTS
+      }
+    }
 
     // Sort by glyph index so SD reads are mostly sequential.
     std::sort(mappings.get(), mappings.get() + needCount,
@@ -1210,11 +1250,10 @@ int SdCardFont::fetchAdvancesForCodepoints(uint32_t* codepoints, uint32_t cpCoun
       // Sort staged by codepoint, then merge into the persistent table.
       std::sort(staged.get(), staged.get() + fetched,
                 [](const AdvanceEntry& a, const AdvanceEntry& b) { return a.codepoint < b.codepoint; });
-      mergeIntoAdvanceTable(si, staged.get(), fetched);
+      mergeIntoAdvanceTable(si, staged.get(), fetched, cap);
     }
 
-    LOG_DBG("SDCF", "Advance table style %u: +%u from SD, total=%u/%u", si, fetched, advanceTableSize_[si],
-            ADVANCE_CACHE_LIMIT);
+    LOG_DBG("SDCF", "Advance table style %u: +%u from SD, total=%u/%u", si, fetched, advanceTableSize_[si], cap);
   }
 
   return totalMissed;

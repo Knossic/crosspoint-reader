@@ -984,7 +984,15 @@ void EpubReaderActivity::render(RenderLock&& lock) {
         // The popup's own refresh is a plain FAST, so force the page that replaces it onto the HALF
         // ghost-cleanup path -- otherwise the "INDEXING" text ghosts under the rendered page.
         pagesUntilFullRefresh = 1;
-        const auto popupFn = [this]() { GUI.drawPopup(renderer, tr(STR_INDEXING)); };
+        const auto popupFn = [this](const int pct) {
+          if (pct <= 0) {
+            GUI.drawPopup(renderer, tr(STR_INDEXING));
+            return;
+          }
+          char msg[32];
+          snprintf(msg, sizeof(msg), tr(STR_INDEXING_PERCENT), pct);
+          GUI.drawPopup(renderer, msg);
+        };
         if (!section->createSectionFile(SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
                                         SETTINGS.extraParagraphSpacing, SETTINGS.paragraphAlignment, viewportWidth,
                                         viewportHeight, SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle,

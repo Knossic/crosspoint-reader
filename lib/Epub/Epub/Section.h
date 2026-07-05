@@ -52,6 +52,12 @@ class Section {
     // the EMA is stepped once per build advance (not per redraw) to damp that wobble.
     float smoothedEstimate = 0;
     uint32_t smoothedAtConsumed = 0;
+    // Blocking-build progress popup (createSectionFile path only; unset on the
+    // incremental path). Receives percent 0-100; redraws throttled in
+    // buildSomeMore() because each popup repaint costs a display refresh.
+    std::function<void(int)> popupFn;
+    int lastPopupPct = 0;
+    unsigned long lastPopupMs = 0;
   };
   std::unique_ptr<BuildContext> build_;
   bool buildComplete_ = false;
@@ -92,7 +98,7 @@ class Section {
   bool createSectionFile(int fontId, float lineCompression, bool extraParagraphSpacing, uint8_t paragraphAlignment,
                          uint16_t viewportWidth, uint16_t viewportHeight, bool hyphenationEnabled, bool embeddedStyle,
                          uint8_t imageRendering, bool focusReadingEnabled,
-                         const std::function<void()>& popupFn = nullptr);
+                         const std::function<void(int)>& popupFn = nullptr);
 
   // Incremental build: lay out the section a few pages at a time so a large chapter
   // can show its first page immediately and keep the UI responsive while the rest
@@ -101,7 +107,7 @@ class Section {
   //   each tick: buildSomeMore(N); render up to pageCount; when isBuildComplete() stop.
   bool startBuild(int fontId, float lineCompression, bool extraParagraphSpacing, uint8_t paragraphAlignment,
                   uint16_t viewportWidth, uint16_t viewportHeight, bool hyphenationEnabled, bool embeddedStyle,
-                  uint8_t imageRendering, bool focusReadingEnabled, const std::function<void()>& popupFn = nullptr);
+                  uint8_t imageRendering, bool focusReadingEnabled, const std::function<void(int)>& popupFn = nullptr);
   // Lay out up to maxPages more pages (maxPages <= 0 = build to completion). Returns
   // false on error (the build is abandoned). Sets isBuildComplete() when finished.
   bool buildSomeMore(int maxPages);

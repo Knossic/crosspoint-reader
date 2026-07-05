@@ -60,6 +60,23 @@ void TxtReaderActivity::onExit() {
 }
 
 void TxtReaderActivity::loop() {
+  // While the page-index build runs on the render task, queuing a Pop here
+  // would block the main task on the RenderLock until the build finishes
+  // (minutes for large books) — the "dead buttons during indexing" freeze.
+  // Instead, Back requests an abort; the build loop notices within one page.
+  if (indexBuilding_.load(std::memory_order_relaxed)) {
+    if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
+      indexAbortRequested_.store(true, std::memory_order_relaxed);
+    }
+    return;
+  }
+  // Build was aborted: leave the activity the same way a Back press would.
+  if (indexAborted_.load(std::memory_order_relaxed)) {
+    indexAborted_.store(false, std::memory_order_relaxed);
+    onGoHome();
+    return;
+  }
+
   // Long press BACK (1s+) goes to file selection
   if (mappedInput.isPressed(MappedInputManager::Button::Back) && mappedInput.getHeldTime() >= ReaderUtils::GO_HOME_MS) {
     activityManager.goToFileBrowser(txt ? txt->getPath() : "");
@@ -122,7 +139,15 @@ void TxtReaderActivity::initializeReader() {
   // Try to load cached page index first
   if (!loadPageIndexCache()) {
     // Cache not found, build page index
-    buildPageIndex();
+    if (!buildPageIndex()) {
+      // Aborted by the user: persist nothing (a partial index would be
+      // indistinguishable from a complete one) and let loop() exit.
+      pageOffsets.clear();
+      totalPages = 0;
+      initialized = true;  // don't re-trigger the build on a re-render
+      indexAborted_.store(true, std::memory_order_relaxed);
+      return;
+    }
     // Save to cache for next time
     savePageIndexCache();
   }
@@ -133,7 +158,7 @@ void TxtReaderActivity::initializeReader() {
   initialized = true;
 }
 
-void TxtReaderActivity::buildPageIndex() {
+bool TxtReaderActivity::buildPageIndex() {
   pageOffsets.clear();
   pageOffsets.push_back(0);  // First page starts at offset 0
 
@@ -142,9 +167,22 @@ void TxtReaderActivity::buildPageIndex() {
 
   LOG_DBG("TRS", "Building page index for %zu bytes...", fileSize);
 
+  indexAbortRequested_.store(false, std::memory_order_relaxed);
+  indexBuilding_.store(true, std::memory_order_relaxed);
   GUI.drawPopup(renderer, tr(STR_INDEXING));
 
+  // Progress popup throttle: each drawPopup costs a display refresh
+  // (~500ms), so repaint only after both 5 percentage points AND 2 seconds.
+  int lastShownPct = 0;
+  unsigned long lastPopupMs = millis();
+
   while (offset < fileSize) {
+    if (indexAbortRequested_.load(std::memory_order_relaxed)) {
+      indexBuilding_.store(false, std::memory_order_relaxed);
+      LOG_DBG("TRS", "Page index build aborted at %zu/%zu bytes", offset, fileSize);
+      return false;
+    }
+
     std::vector<std::string> tempLines;
     size_t nextOffset = offset;
 
@@ -162,6 +200,15 @@ void TxtReaderActivity::buildPageIndex() {
       pageOffsets.push_back(offset);
     }
 
+    const int pct = static_cast<int>((static_cast<uint64_t>(offset) * 100) / fileSize);
+    if (pct >= lastShownPct + 5 && millis() - lastPopupMs >= 2000) {
+      char msg[32];
+      snprintf(msg, sizeof(msg), tr(STR_INDEXING_PERCENT), pct);
+      GUI.drawPopup(renderer, msg);
+      lastShownPct = pct;
+      lastPopupMs = millis();
+    }
+
     // Yield to other tasks periodically
     if (pageOffsets.size() % 20 == 0) {
       vTaskDelay(1);
@@ -169,7 +216,9 @@ void TxtReaderActivity::buildPageIndex() {
   }
 
   totalPages = pageOffsets.size();
+  indexBuilding_.store(false, std::memory_order_relaxed);
   LOG_DBG("TRS", "Built page index: %d pages", totalPages);
+  return true;
 }
 
 bool TxtReaderActivity::loadPageAtOffset(size_t offset, std::vector<std::string>& outLines, size_t& nextOffset) {
@@ -324,6 +373,10 @@ void TxtReaderActivity::render(RenderLock&&) {
   // Initialize reader if not done
   if (!initialized) {
     initializeReader();
+  }
+
+  if (indexAborted_.load(std::memory_order_relaxed)) {
+    return;  // build cancelled; loop() is about to exit the activity
   }
 
   if (pageOffsets.empty()) {

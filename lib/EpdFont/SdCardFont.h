@@ -227,16 +227,30 @@ class SdCardFont {
     uint16_t advanceX;  // 12.4 fixed-point
   };
   // Per-style advance table. Sorted by codepoint for binary lookup.
-  // Bounded to ADVANCE_CACHE_LIMIT entries; persists across layout passes
-  // (across calls to clearCache()) so repeated indexing of the same font
-  // amortizes SD reads. Cleared only on font unload or clearPersistentCache().
+  // Persists across layout passes (across calls to clearCache()) so repeated
+  // indexing of the same font amortizes SD reads. Cleared only on font unload
+  // or clearPersistentCache().
+  //
+  // Sizing: the steady-state cap is ADVANCE_CACHE_LIMIT, but a single
+  // buildAdvanceTable() call may grow the table up to that call's unique
+  // codepoint count (<= MAX_UNIQUE_CODEPOINTS) so the text being laid out is
+  // always fully covered — CJK text routinely exceeds 768 unique codepoints
+  // per book. When a new text would overflow the cap, entries not needed by
+  // that text are evicted first (working-set semantics), so latin-only usage
+  // never exceeds ADVANCE_CACHE_LIMIT and the table shrinks back as soon as
+  // a smaller working set replaces a large one.
   static constexpr uint32_t ADVANCE_CACHE_LIMIT = 768;
   AdvanceEntry* advanceTable_[MAX_STYLES] = {};
   uint32_t advanceTableSize_[MAX_STYLES] = {};
   bool advanceTableLookup(uint8_t styleIdx, uint32_t codepoint, uint16_t* outAdvance) const;
   // Merge sortedNew (sorted by codepoint, no overlap with existing) into the
-  // advance table for styleIdx, preserving sort order; cap-truncates the tail.
-  void mergeIntoAdvanceTable(uint8_t styleIdx, const AdvanceEntry* sortedNew, uint32_t newCount);
+  // advance table for styleIdx, preserving sort order; entries past `cap` are
+  // dropped from the tail of the merge.
+  void mergeIntoAdvanceTable(uint8_t styleIdx, const AdvanceEntry* sortedNew, uint32_t newCount, uint32_t cap);
+  // Drop advance entries whose codepoint is NOT in sortedCps (sorted, unique).
+  // In-place; used to evict stale working-set entries before a merge that
+  // would otherwise overflow ADVANCE_CACHE_LIMIT.
+  void compactAdvanceTable(uint8_t styleIdx, const uint32_t* sortedCps, uint32_t cpCount);
 
   Stats stats_;
   uint32_t contentHash_ = 0;

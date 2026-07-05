@@ -18,8 +18,6 @@
 #include "Epub/converters/ImageToFramebufferDecoder.h"
 #include "Epub/htmlEntities.h"
 
-// Minimum file size (in bytes) to show indexing popup - smaller chapters don't benefit from it
-constexpr size_t MIN_SIZE_FOR_POPUP = 10 * 1024;  // 10KB
 constexpr size_t PARSE_BUFFER_SIZE = 1024;
 
 // Hard cap on the number of anchor IDs recorded per chapter. Legitimate navigation
@@ -1309,11 +1307,6 @@ bool ChapterHtmlSlimParser::beginParse() {
     destroyXmlParser(xmlParser_);
     xmlParser_ = nullptr;
     return false;
-  }
-
-  // Get file size to decide whether to show indexing popup.
-  if (popupFn && parseFile_.size() >= MIN_SIZE_FOR_POPUP) {
-    popupFn();
   }
 
   XML_SetUserData(xmlParser_, this);
