@@ -44,6 +44,20 @@ inline bool utf8IsCjkBreakable(const uint32_t cp) {
          || (cp >= 0x2A700 && cp <= 0x2B73F);  // CJK Extension C
 }
 
+// CSS Text §4.1.2 segment break transformation: a collapsed whitespace boundary
+// (e.g. a source-file newline inside a paragraph of hard-wrapped CJK text) between
+// two of these characters must be removed rather than rendered as a space.
+// Hangul is excluded — Korean uses spaces as real word separators.
+inline bool utf8IsCjkSegmentBreakDroppable(const uint32_t cp) {
+  if ((cp >= 0x1100 && cp <= 0x11FF)        // Hangul Jamo
+      || (cp >= 0x3130 && cp <= 0x318F)     // Hangul Compatibility Jamo
+      || (cp >= 0xAC00 && cp <= 0xD7FF)     // Hangul Syllables + Jamo Extended-B
+      || (cp >= 0xFFA0 && cp <= 0xFFDC)) {  // Halfwidth Hangul
+    return false;
+  }
+  return utf8IsCjkBreakable(cp);
+}
+
 // CJK line-breaking prohibition (kinsoku) rules: closing punctuation must not
 // start a line, opening punctuation must not end a line.
 bool utf8IsNoBreakBeforeCjkPunctuation(uint32_t cp);

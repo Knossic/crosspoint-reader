@@ -90,11 +90,16 @@ if (parsedSize != fileSize) {
 
 ## `section.bin`
 
-### Version 28
+### Version 29
 
 Each file in `sections/*.bin` stores one laid-out spine section. The header is
 also the cache-busting key: if any layout-affecting setting differs from the
 current reader settings, the section is discarded and rebuilt.
+
+Version 29 applies the CSS segment break transformation during layout:
+whitespace between two CJK characters (excluding Hangul) is dropped instead of
+rendered as a space. The binary structure is unchanged from version 28; the
+bump forces re-layout of cached sections.
 
 Version 28 includes:
 
@@ -115,7 +120,7 @@ import std.mem;
 import std.string;
 import std.core;
 
-#define EXPECTED_VERSION 28
+#define EXPECTED_VERSION 29
 #define MAX_STRING_LENGTH 65535
 #define FOOTNOTE_NUMBER_LEN 32
 #define FOOTNOTE_HREF_LEN 96

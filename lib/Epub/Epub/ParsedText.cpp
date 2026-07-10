@@ -213,6 +213,23 @@ void ParsedText::addWord(std::string word, const EpdFontFamily::Style fontStyle,
     effectiveNoSpaceBefore = true;
   }
 
+  // CSS Text segment break transformation: hard-wrapped CJK source text puts a
+  // whitespace boundary (newline or stray space) between two ideographs mid-word.
+  // Rendering it as a space leaves random gaps inside CJK words, so drop it: the
+  // boundary stays a stretchable, breakable gap (noSpaceBefore) when kinsoku allows
+  // a break there, otherwise the two words attach outright.
+  if (!effectiveAttachToPrevious && !effectiveNoSpaceBefore && !words.empty()) {
+    const uint32_t prevCp = lastCodepoint(words.back());
+    const uint32_t firstCp = firstCodepoint(word);
+    if (utf8IsCjkSegmentBreakDroppable(prevCp) && utf8IsCjkSegmentBreakDroppable(firstCp)) {
+      if (utf8HasCjkBreakOpportunityBetween(prevCp, firstCp)) {
+        effectiveNoSpaceBefore = true;
+      } else {
+        effectiveAttachToPrevious = true;
+      }
+    }
+  }
+
   if (auto breakOffsets = cjkCharacterBreakByteOffsets(word); !breakOffsets.empty()) {
     bool firstToken = true;
     size_t tokenStart = 0;

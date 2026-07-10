@@ -11,8 +11,8 @@
 #include "parsers/ChapterHtmlSlimParser.h"
 
 namespace {
-// v28: text decoration bits now include line-through in serialized wordStyles.
-constexpr uint8_t SECTION_FILE_VERSION = 28;
+// v29: segment break transformation — whitespace between CJK chars is dropped, changing layout.
+constexpr uint8_t SECTION_FILE_VERSION = 29;
 // Written into the version field while a build is in progress; patched to
 // SECTION_FILE_VERSION only when the build is finalized. An abandoned /
 // crash-interrupted .bin therefore carries version 0, which loadSectionFile rejects
@@ -25,7 +25,12 @@ constexpr uint8_t SECTION_FILE_INCOMPLETE_VERSION = 0;
 // rebuilding in the background. Uses the same header layout as SECTION_FILE_VERSION,
 // so finalized files are untouched by this feature; older firmware treats the sentinel
 // as an unknown version and rebuilds, which is a safe downgrade.
-constexpr uint8_t SECTION_FILE_PARTIAL_VERSION = 0xFE;
+// The sentinel is derived from SECTION_FILE_VERSION (high bit set) so a layout-version
+// bump also invalidates partial files. A fixed sentinel (formerly 0xFE) let stale
+// partials from older firmware bypass the version check and be resumed with the old
+// layout baked in.
+constexpr uint8_t SECTION_FILE_PARTIAL_VERSION = 0x80 | SECTION_FILE_VERSION;
+static_assert(SECTION_FILE_VERSION < 0x80, "partial sentinel must not collide with the finalized version");
 constexpr uint32_t HEADER_SIZE = sizeof(uint8_t) + sizeof(int) + sizeof(float) + sizeof(bool) + sizeof(uint8_t) +
                                  sizeof(uint16_t) + sizeof(uint16_t) + sizeof(uint16_t) + sizeof(bool) + sizeof(bool) +
                                  sizeof(uint8_t) + sizeof(bool) + sizeof(uint32_t) + sizeof(uint32_t) +
