@@ -1307,11 +1307,12 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   // cannot be written while BUSY is asserted, so the planes must stage in DRAM
   // until the wait ends; two raw planes would need 96KB, which this board's
   // headroom can't spare. Instead each plane is rendered band-by-band into a
-  // small scratch (same tiling as the sequential fallback below) and RLE-packed
-  // into a plane-sized store (~56KB arena total). Text planes RLE to ~16KB
-  // (LSB) / ~24KB (MSB) on device, so both fit with headroom; if a dense page
-  // overflows the store anyway, the packed bands are kept and only the rest
-  // re-render live after the wait — never worse than not caching them. The
+  // small scratch (same tiling as the sequential fallback below) and packed by
+  // PlaneRle (vertical XOR predictor + gamma-coded bit runs) into the store —
+  // the whole arena is one plane's footprint (48KB). Both packed planes
+  // measure ~30KB on device, ~10KB under the store; if a page overflows
+  // anyway, the packed bands are kept and only the rest re-render live after
+  // the wait — never worse than not caching them. The
   // arena is a transient per-page allocation, deliberately not a pinned member —
   // chapter loads (which can want ~96KB for giant-spine inflation) happen
   // between page renders, when this buffer is not held. On OOM fall through to
@@ -1327,12 +1328,12 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
     const int bands = (gh + STRIP_ROWS - 1) / STRIP_ROWS;
     const size_t scratchBytes = static_cast<size_t>(gwBytes) * STRIP_ROWS;
     const size_t planeBytes = static_cast<size_t>(gwBytes) * gh;
-    auto arena = (bands <= MAX_BANDS) ? makeUniqueNoThrow<uint8_t[]>(scratchBytes + planeBytes) : nullptr;
+    auto arena = (bands <= MAX_BANDS) ? makeUniqueNoThrow<uint8_t[]>(planeBytes) : nullptr;
     if (arena) {
       uint8_t* const scratch = arena.get();
       uint8_t* const store = arena.get() + scratchBytes;
-      const size_t storeCap = planeBytes;
-      uint16_t bandLen[2][MAX_BANDS];  // encoded band <= bandBytes + ceil(bandBytes/128), fits uint16
+      const size_t storeCap = planeBytes - scratchBytes;
+      uint16_t bandLen[2][MAX_BANDS];  // encoded band worst case ~1.5x bandBytes (12KB), fits uint16
       size_t planeStart[2] = {0, 0};
       size_t planeSize[2] = {0, 0};
       int cachedBands[2] = {0, 0};
@@ -1353,8 +1354,10 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
           renderer.clearScreen(0x00);
           renderGrayscalePass();
           renderer.endStripTarget();
-          const size_t n =
-              PlaneRle::encode(scratch, static_cast<size_t>(gwBytes) * rows, store + storeUsed, storeCap - storeUsed);
+          // encode() applies its XOR predictor to scratch in place; the band
+          // is not reused after packing, so that's harmless.
+          const size_t n = PlaneRle::encode(scratch, static_cast<size_t>(gwBytes), static_cast<size_t>(rows),
+                                            store + storeUsed, storeCap - storeUsed);
           if (n == 0) {
             planeSize[planeIdx] = storeUsed - planeStart[planeIdx];
             return false;
@@ -1392,8 +1395,8 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
           const int rows = (gh - y < STRIP_ROWS) ? (gh - y) : STRIP_ROWS;
           bool haveBand = band < cachedBands[planeIdx];
           if (haveBand) {
-            haveBand =
-                PlaneRle::decode(store + off, bandLen[planeIdx][band], scratch, static_cast<size_t>(gwBytes) * rows);
+            haveBand = PlaneRle::decode(store + off, bandLen[planeIdx][band], scratch, static_cast<size_t>(gwBytes),
+                                        static_cast<size_t>(rows));
             off += bandLen[planeIdx][band];
             if (!haveBand) {
               // Can't happen for data we just encoded; render live as insurance.
@@ -1432,8 +1435,7 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
       return;
     }
     if (bands <= MAX_BANDS) {
-      LOG_ERR("ERS", "OOM: gray arena (%u bytes); sequential grayscale",
-              static_cast<unsigned>(scratchBytes + planeBytes));
+      LOG_ERR("ERS", "OOM: gray arena (%u bytes); sequential grayscale", static_cast<unsigned>(planeBytes));
     }
   }
 
