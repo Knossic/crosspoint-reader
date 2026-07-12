@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
 """Build SD card fonts from a declarative YAML config.
 
-Reads sd-fonts.yaml, downloads any missing source fonts, runs
-fontconvert_sdcard.py in parallel for each family, and optionally
-generates the fonts.json manifest.
+Reads sd-fonts.yaml, downloads any missing source fonts, and runs
+fontconvert_sdcard.py in parallel for each family.
 
 Usage:
     # Generate fonts (output in ./output/)
     python3 build-sd-fonts.py
-
-    # Generate fonts + manifest
-    python3 build-sd-fonts.py --manifest --base-url "http://localhost:8000/"
 
     # Custom config / output paths
     python3 build-sd-fonts.py --config my-fonts.yaml --output-dir dist/
@@ -283,38 +279,6 @@ def build_family(
         return name, False, str(e)
 
 
-def generate_manifest(
-    config_path: Path, output_base: Path, base_url: str, manifest_path: Path
-):
-    """Generate fonts.json manifest from config + built output.
-
-    Uses the standalone generate-font-manifest.py as a subprocess so
-    descriptions come from the YAML config via --descriptions-from.
-    """
-    manifest_script = SCRIPT_DIR.parent.parent.parent / "scripts" / "generate-font-manifest.py"
-
-    if not base_url.endswith("/"):
-        base_url += "/"
-
-    cmd = [
-        sys.executable, str(manifest_script),
-        "--input", str(output_base),
-        "--base-url", base_url,
-        "--output", str(manifest_path),
-    ]
-
-    if config_path.exists():
-        cmd.extend(["--descriptions-from", str(config_path)])
-
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"ERROR: Manifest generation failed:\n{result.stderr}", file=sys.stderr)
-        return
-    print(result.stdout, end="")
-    print(f"Manifest written: {manifest_path}")
-
-
 def main():
     parser = argparse.ArgumentParser(description="Build SD card fonts from YAML config")
     parser.add_argument(
@@ -324,11 +288,6 @@ def main():
         "--output-dir", default=str(DEFAULT_OUTPUT), help="Output directory for .cpfont files"
     )
     parser.add_argument("--only", help="Comma-separated family names to build (default: all)")
-    parser.add_argument("--manifest", action="store_true", help="Also generate fonts.json manifest")
-    parser.add_argument("--base-url", default="", help="Base URL for manifest (required with --manifest)")
-    parser.add_argument(
-        "--manifest-output", default=None, help="Manifest output path (default: <output-dir>/fonts.json)"
-    )
     parser.add_argument(
         "--jobs", "-j", type=int, default=None,
         help="Max parallel jobs (default: number of families)"
@@ -343,9 +302,6 @@ def main():
         help="Per-family timeout in seconds (default: 600)"
     )
     args = parser.parse_args()
-
-    if args.manifest and not args.base_url:
-        parser.error("--base-url is required when using --manifest")
 
     # Load config
     config_path = Path(args.config)
@@ -432,13 +388,6 @@ def main():
 
     if failed:
         print(f"\nFailed families: {', '.join(failed)}", file=sys.stderr)
-
-    # Manifest
-    if args.manifest:
-        manifest_path = Path(args.manifest_output) if args.manifest_output else output_base / "fonts.json"
-        generate_manifest(config_path, output_base, args.base_url, manifest_path)
-
-    if failed:
         sys.exit(1)
 
 

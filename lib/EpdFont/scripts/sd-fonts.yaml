@@ -1,13 +1,13 @@
 # SD Card Font Families for CrossPoint Reader
 #
-# This file is the single source of truth for which fonts are generated,
-# how they're sourced, and how they're described in the download manifest.
+# This file is the single source of truth for which fonts are generated
+# and how they're sourced.
 #
 # Adding a new font family = adding a block here. No code changes needed.
 #
 # Fields:
 #   name:        Output family name (used in filenames and on-device UI)
-#   description: Human-readable description (shown in download UI and manifest)
+#   description: Human-readable description (documentation only)
 #   intervals:   Comma-separated Unicode interval presets for fontconvert_sdcard.py
 #   sizes:       Point sizes to generate
 #   force_autohint: (optional) Force FreeType auto-hinter instead of native hinting
