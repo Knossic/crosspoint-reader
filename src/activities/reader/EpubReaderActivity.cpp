@@ -1308,10 +1308,10 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   // until the wait ends; two raw planes would need 96KB, which this board's
   // headroom can't spare. Instead each plane is rendered band-by-band into a
   // small scratch (same tiling as the sequential fallback below) and RLE-packed
-  // into a store, all inside one plane-sized arena — the same 48KB peak as a
-  // single raw plane. Text planes are mostly 0x00 and compress 3-6x, so both
-  // typically fit; a plane that overflows the store (very dense page) is simply
-  // re-rendered live after the wait, which is no worse than not caching it. The
+  // into a plane-sized store (~56KB arena total). Text planes RLE to ~16KB
+  // (LSB) / ~24KB (MSB) on device, so both fit with headroom; if a dense page
+  // overflows the store anyway, the packed bands are kept and only the rest
+  // re-render live after the wait — never worse than not caching them. The
   // arena is a transient per-page allocation, deliberately not a pinned member —
   // chapter loads (which can want ~96KB for giant-spine inflation) happen
   // between page renders, when this buffer is not held. On OOM fall through to
@@ -1327,23 +1327,24 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
     const int bands = (gh + STRIP_ROWS - 1) / STRIP_ROWS;
     const size_t scratchBytes = static_cast<size_t>(gwBytes) * STRIP_ROWS;
     const size_t planeBytes = static_cast<size_t>(gwBytes) * gh;
-    auto arena = (bands <= MAX_BANDS) ? makeUniqueNoThrow<uint8_t[]>(planeBytes) : nullptr;
+    auto arena = (bands <= MAX_BANDS) ? makeUniqueNoThrow<uint8_t[]>(scratchBytes + planeBytes) : nullptr;
     if (arena) {
       uint8_t* const scratch = arena.get();
       uint8_t* const store = arena.get() + scratchBytes;
-      const size_t storeCap = planeBytes - scratchBytes;
+      const size_t storeCap = planeBytes;
       uint16_t bandLen[2][MAX_BANDS];  // encoded band <= bandBytes + ceil(bandBytes/128), fits uint16
       size_t planeStart[2] = {0, 0};
       size_t planeSize[2] = {0, 0};
-      bool planeCached[2] = {false, false};
+      int cachedBands[2] = {0, 0};
       size_t storeUsed = 0;
 
       ReaderUtils::displayWithRefreshCycleAsyncStart(renderer, pagesUntilFullRefresh);
 
       // Render one plane band-by-band into the scratch, RLE-appending each band
-      // to the store. On overflow rolls the store back and returns false.
+      // to the store. On overflow keeps the bands packed so far (a failed
+      // encode writes nothing durable) and returns false.
       auto renderAndCompressPlane = [&](int planeIdx, bool isLsb) {
-        const size_t start = storeUsed;
+        planeStart[planeIdx] = storeUsed;
         renderer.setRenderMode(isLsb ? GfxRenderer::GRAYSCALE_LSB : GfxRenderer::GRAYSCALE_MSB);
         int band = 0;
         for (int y = 0; y < gh; y += STRIP_ROWS, band++) {
@@ -1355,19 +1356,18 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
           const size_t n =
               PlaneRle::encode(scratch, static_cast<size_t>(gwBytes) * rows, store + storeUsed, storeCap - storeUsed);
           if (n == 0) {
-            storeUsed = start;
+            planeSize[planeIdx] = storeUsed - planeStart[planeIdx];
             return false;
           }
           bandLen[planeIdx][band] = static_cast<uint16_t>(n);
           storeUsed += n;
+          cachedBands[planeIdx] = band + 1;
         }
-        planeStart[planeIdx] = start;
-        planeSize[planeIdx] = storeUsed - start;
-        planeCached[planeIdx] = true;
+        planeSize[planeIdx] = storeUsed - planeStart[planeIdx];
         return true;
       };
 
-      // If the LSB plane doesn't fit, the near-identical MSB plane won't either.
+      // If the LSB plane didn't fully fit, the store is exhausted — skip the MSB.
       if (renderAndCompressPlane(0, true)) {
         renderAndCompressPlane(1, false);
       }
@@ -1380,17 +1380,17 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
       renderer.displayBufferAsyncFinish(true);
       const auto tDisplay = millis();
 
-      // Panel idle from here on. Cached planes decompress into the scratch and
-      // stream straight out; an uncached plane re-renders its bands live.
+      // Panel idle from here on. Cached bands decompress into the scratch and
+      // stream straight out; any uncached bands re-render live.
       auto uploadPlane = [&](int planeIdx, bool isLsb) {
-        if (!planeCached[planeIdx]) {
+        if (cachedBands[planeIdx] < bands) {
           renderer.setRenderMode(isLsb ? GfxRenderer::GRAYSCALE_LSB : GfxRenderer::GRAYSCALE_MSB);
         }
         size_t off = planeStart[planeIdx];
         int band = 0;
         for (int y = 0; y < gh; y += STRIP_ROWS, band++) {
           const int rows = (gh - y < STRIP_ROWS) ? (gh - y) : STRIP_ROWS;
-          bool haveBand = planeCached[planeIdx];
+          bool haveBand = band < cachedBands[planeIdx];
           if (haveBand) {
             haveBand =
                 PlaneRle::decode(store + off, bandLen[planeIdx][band], scratch, static_cast<size_t>(gwBytes) * rows);
@@ -1424,14 +1424,16 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
       const auto tEnd = millis();
       LOG_DBG("ERS",
               "Page render (overlap+rle): prewarm=%lums bw_render=%lums gray_in_wait=%lums "
-              "(rle %u+%uB cached=%d%d) wait_finish=%lums upload=%lums gray_display=%lums cleanup=%lums total=%lums",
+              "(rle %u+%uB bands=%d+%d/%d) wait_finish=%lums upload=%lums gray_display=%lums cleanup=%lums "
+              "total=%lums",
               tPrewarm - t0, tBwRender - tPrewarm, tGrayInWait - tBwRender, static_cast<unsigned>(planeSize[0]),
-              static_cast<unsigned>(planeSize[1]), planeCached[0] ? 1 : 0, planeCached[1] ? 1 : 0,
-              tDisplay - tGrayInWait, tUpload - tDisplay, tGrayDisplay - tUpload, tEnd - tGrayDisplay, tEnd - t0);
+              static_cast<unsigned>(planeSize[1]), cachedBands[0], cachedBands[1], bands, tDisplay - tGrayInWait,
+              tUpload - tDisplay, tGrayDisplay - tUpload, tEnd - tGrayDisplay, tEnd - t0);
       return;
     }
     if (bands <= MAX_BANDS) {
-      LOG_ERR("ERS", "OOM: gray arena (%u bytes); sequential grayscale", static_cast<unsigned>(planeBytes));
+      LOG_ERR("ERS", "OOM: gray arena (%u bytes); sequential grayscale",
+              static_cast<unsigned>(scratchBytes + planeBytes));
     }
   }
 
