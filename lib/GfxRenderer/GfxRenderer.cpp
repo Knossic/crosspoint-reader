@@ -1523,6 +1523,18 @@ void GfxRenderer::displayBuffer(const HalDisplay::RefreshMode refreshMode) const
   display.displayBuffer(refreshMode, fadingFix);
 }
 
+bool GfxRenderer::supportsAsyncDisplay() const { return display.supportsAsyncDisplay(); }
+
+void GfxRenderer::displayBufferAsyncStart(const HalDisplay::RefreshMode refreshMode) const {
+  auto elapsed = millis() - start_ms;
+  LOG_DBG("GFX", "Time = %lu ms from clearScreen to displayBufferAsyncStart", elapsed);
+  display.displayBufferAsyncStart(refreshMode, fadingFix);
+}
+
+void GfxRenderer::displayBufferAsyncFinish(bool skipRamResync) const {
+  display.displayBufferAsyncFinish(skipRamResync);
+}
+
 std::string GfxRenderer::truncatedText(const int fontId, const char* text, const int maxWidth,
                                        const EpdFontFamily::Style style) const {
   if (!text || maxWidth <= 0) return "";

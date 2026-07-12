@@ -69,6 +69,19 @@ inline void displayWithRefreshCycle(const GfxRenderer& renderer, int& pagesUntil
   }
 }
 
+// Async displayWithRefreshCycle: same FAST/HALF cadence, but only kicks the
+// refresh — the caller renders grayscale planes during the waveform and must
+// call renderer.displayBufferAsyncFinish() before touching the display again.
+inline void displayWithRefreshCycleAsyncStart(const GfxRenderer& renderer, int& pagesUntilFullRefresh) {
+  if (pagesUntilFullRefresh <= 1) {
+    renderer.displayBufferAsyncStart(HalDisplay::HALF_REFRESH);
+    pagesUntilFullRefresh = SETTINGS.getRefreshFrequency();
+  } else {
+    renderer.displayBufferAsyncStart();
+    pagesUntilFullRefresh--;
+  }
+}
+
 // Grayscale anti-aliasing pass. Renders content twice (LSB + MSB) to build
 // the grayscale buffer. Only the content callback is re-rendered — status bars
 // and other overlays should be drawn before calling this.

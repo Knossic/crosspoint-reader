@@ -1300,6 +1300,69 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   }
   const auto tBwRender = millis();
 
+  // Overlapped grayscale path: kick the BW refresh without blocking, then render
+  // the LSB plane while the panel runs its ~500ms waveform — the CPU is otherwise
+  // idle for that whole window (it just polls BUSY). Only the LSB plane hides in
+  // the wait; the MSB plane renders serially after it (hiding both would need a
+  // second 48KB buffer, which this board's headroom can't spare). Needs a
+  // full-frame plane buffer: a transient per-page allocation, deliberately not a
+  // pinned member — chapter loads (which can want ~96KB for giant-spine inflation)
+  // happen between page renders, when this buffer is not held. On OOM fall
+  // through to the sequential 8KB-strip paths below. Image pages keep their
+  // double-refresh sequence: they re-render the framebuffer between refreshes,
+  // which the async contract forbids (the framebuffer is the differential
+  // baseline until the grayscale planes replace it).
+  if (!pageHasImages && needsAnyGrayscale && renderer.supportsStripGrayscale() && renderer.supportsAsyncDisplay()) {
+    const int gh = renderer.getDisplayHeight();
+    const size_t planeBytes = static_cast<size_t>(renderer.getDisplayWidthBytes()) * gh;
+    auto plane = makeUniqueNoThrow<uint8_t[]>(planeBytes);
+    if (plane) {
+      ReaderUtils::displayWithRefreshCycleAsyncStart(renderer, pagesUntilFullRefresh);
+
+      // LSB plane, rendered during the refresh wait.
+      renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
+      renderer.beginStripTarget(plane.get(), 0, gh);
+      renderer.clearScreen(0x00);
+      renderGrayscalePass();
+      renderer.endStripTarget();
+      const auto tGrayLsb = millis();
+
+      // Remaining waveform wait. The driver's post-refresh RAM resync is skipped:
+      // both planes are overwritten with the gray LSB/MSB data right below, and
+      // cleanupGrayscaleWithFrameBuffer() re-seeds the differential baseline —
+      // the resync would be 96KB of SPI squarely in the visible BW->gray window.
+      renderer.displayBufferAsyncFinish(true);
+      const auto tDisplay = millis();
+
+      renderer.writeGrayscalePlaneStrip(true, plane.get(), 0, gh);
+
+      // MSB plane (panel idle from here on; buffer reused).
+      renderer.setRenderMode(GfxRenderer::GRAYSCALE_MSB);
+      renderer.beginStripTarget(plane.get(), 0, gh);
+      renderer.clearScreen(0x00);
+      renderGrayscalePass();
+      renderer.endStripTarget();
+      renderer.writeGrayscalePlaneStrip(false, plane.get(), 0, gh);
+      const auto tGrayMsb = millis();
+
+      renderer.setRenderMode(GfxRenderer::BW);
+      renderer.displayGrayBuffer();
+      const auto tGrayDisplay = millis();
+
+      // BW framebuffer is intact; re-sync controller RAM for the next
+      // differential page turn directly from it.
+      renderer.cleanupGrayscaleWithFrameBuffer();
+      const auto tEnd = millis();
+      LOG_DBG("ERS",
+              "Page render (overlap): prewarm=%lums bw_render=%lums lsb_in_wait=%lums wait_finish=%lums "
+              "msb=%lums gray_display=%lums cleanup=%lums total=%lums",
+              tPrewarm - t0, tBwRender - tPrewarm, tGrayLsb - tBwRender, tDisplay - tGrayLsb, tGrayMsb - tDisplay,
+              tGrayDisplay - tGrayMsb, tEnd - tGrayDisplay, tEnd - t0);
+      return;
+    }
+    LOG_ERR("ERS", "OOM: gray plane buffer (%u bytes); sequential grayscale", static_cast<unsigned>(planeBytes));
+  }
+
   if (pageHasImages) {
     // Double FAST_REFRESH with selective image blanking (pablohc's technique):
     // HALF_REFRESH sets particles too firmly for the grayscale LUT to adjust.

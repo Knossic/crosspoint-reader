@@ -41,6 +41,17 @@ class HalDisplay {
   void displayBuffer(RefreshMode mode = RefreshMode::FAST_REFRESH, bool turnOffScreen = false);
   void refreshDisplay(RefreshMode mode = RefreshMode::FAST_REFRESH, bool turnOffScreen = false);
 
+  // Async variant of displayBuffer(): start kicks the refresh and returns while
+  // the panel runs the waveform; finish blocks until it completes. The CPU is
+  // free between the calls, but the display must not be touched and the
+  // framebuffer must stay unmodified. Degrades to synchronous on panels without
+  // async support (finish becomes a no-op). See EInkDisplay::displayBufferAsyncStart.
+  bool supportsAsyncDisplay() const;
+  void displayBufferAsyncStart(RefreshMode mode = RefreshMode::FAST_REFRESH, bool turnOffScreen = false);
+  // skipRamResync: caller overwrites both RAM planes right after (grayscale
+  // overlay) and re-seeds the baseline itself via cleanupGrayscaleBuffers().
+  void displayBufferAsyncFinish(bool skipRamResync = false);
+
   // Power management
   void deepSleep();
 

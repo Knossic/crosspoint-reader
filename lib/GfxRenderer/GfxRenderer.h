@@ -167,6 +167,16 @@ class GfxRenderer {
   int getScreenWidth() const;
   int getScreenHeight() const;
   void displayBuffer(HalDisplay::RefreshMode refreshMode = HalDisplay::FAST_REFRESH) const;
+  // Async variant of displayBuffer(): start kicks the panel refresh and returns
+  // while the waveform runs (CPU free for e.g. grayscale plane rendering into a
+  // strip target); finish blocks until the panel is idle again. The framebuffer
+  // must stay unmodified between the calls. supportsAsyncDisplay() gates use;
+  // on other panels start degrades to a blocking displayBuffer().
+  bool supportsAsyncDisplay() const;
+  void displayBufferAsyncStart(HalDisplay::RefreshMode refreshMode = HalDisplay::FAST_REFRESH) const;
+  // skipRamResync: only when both grayscale planes are written immediately after
+  // and cleanupGrayscaleWithFrameBuffer() re-seeds the differential baseline.
+  void displayBufferAsyncFinish(bool skipRamResync = false) const;
   // EXPERIMENTAL: Windowed update - display only a rectangular region
   // void displayWindow(int x, int y, int width, int height) const;
   void invertScreen() const;
