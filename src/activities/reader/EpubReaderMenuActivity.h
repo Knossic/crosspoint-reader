@@ -13,10 +13,11 @@ class EpubReaderMenuActivity final : public Activity {
  public:
   // Menu actions available from the reader menu.
   enum class MenuAction {
+    START_AUTO_TURN,
     SELECT_CHAPTER,
     FOOTNOTES,
     GO_TO_PERCENT,
-    AUTO_PAGE_TURN,
+    AUTO_TURN_RATE,
     ROTATE_SCREEN,
     BOOKMARKS,
     TOGGLE_BOOKMARK,
@@ -53,10 +54,10 @@ class EpubReaderMenuActivity final : public Activity {
   OptionPopup optionPopup;
   std::string title = "Reader Menu";
   uint8_t pendingOrientation = 0;
-  uint8_t selectedPageTurnOption = 0;
   const std::vector<StrId> orientationLabels = {StrId::STR_PORTRAIT, StrId::STR_LANDSCAPE_CW, StrId::STR_INVERTED,
                                                 StrId::STR_LANDSCAPE_CCW};
-  const std::vector<const char*> pageTurnLabels = {I18N.get(StrId::STR_STATE_OFF), "1", "3", "6", "12"};
+  // Right-edge value shown on the auto-turn rate row (e.g. "15 s"), formatted once at entry.
+  char autoTurnRateLabel[16] = "";
   int currentPage = 0;
   int totalPages = 0;
   int bookProgressPercent = 0;

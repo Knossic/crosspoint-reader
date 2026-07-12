@@ -97,7 +97,13 @@ class EpubReaderActivity final : public Activity {
   // because no KOReader credentials are stored.
   bool launchKOReaderSync();
   void applyOrientation(uint8_t orientation);
-  void toggleAutoPageTurn(uint8_t selectedPageTurnOption);
+  // Activates automatic page turn using the persisted SETTINGS.autoTurnSecondsPerPage rate.
+  // Deactivation is just automaticPageTurnActive = false (any Confirm/Back press, end of book).
+  void startAutoPageTurn();
+  // Opens the seconds-per-page stepper and persists the chosen rate.
+  void openAutoTurnRatePicker();
+  // Corner marker (top-right triangle) shown while auto page turn is running.
+  void drawAutoTurnIndicator() const;
   void pageTurn(bool isForwardTurn);
   void loadCachedBookmarks();
   void addBookmark();
@@ -115,6 +121,10 @@ class EpubReaderActivity final : public Activity {
   void loop() override;
   void render(RenderLock&& lock) override;
   bool isReaderActivity() const override { return true; }
+  // Auto page turn must hold off the inactivity sleep timer: it renders without button input.
+  // Deliberate trade-off: this also keeps the CPU at full clock with no idle backstop, so an
+  // unattended session runs until end-of-book (which deactivates auto turn) or a button press.
+  bool preventAutoSleep() override { return automaticPageTurnActive; }
   ScreenshotInfo getScreenshotInfo() const override;
   CrossPointPosition getCurrentPosition() const;
 };

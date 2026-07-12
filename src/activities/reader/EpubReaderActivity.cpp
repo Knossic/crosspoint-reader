@@ -32,6 +32,7 @@
 #include "QrDisplayActivity.h"
 #include "ReaderUtils.h"
 #include "RecentBooksStore.h"
+#include "activities/util/IntervalSelectionActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "util/BookmarkUtil.h"
@@ -39,8 +40,6 @@
 
 namespace {
 // pagesPerRefresh now comes from SETTINGS.getRefreshFrequency()
-// pages per minute, first item is 1 to prevent division by zero if accessed
-constexpr int PAGE_TURN_RATES[] = {1, 1, 3, 6, 12};
 constexpr size_t initialBookmarkCacheCapacity = 16;
 constexpr float bookmarkProgressEpsilon = 0.0001f;
 
@@ -248,7 +247,6 @@ void EpubReaderActivity::openReaderMenu() {
                            // Always apply orientation change even if the menu was cancelled
                            const auto& menu = std::get<MenuResult>(result.data);
                            applyOrientation(menu.orientation);
-                           toggleAutoPageTurn(menu.pageTurnOption);
                            if (!result.isCancelled) {
                              onReaderMenuConfirm(static_cast<EpubReaderMenuActivity::MenuAction>(menu.action));
                            }
@@ -316,6 +314,22 @@ void EpubReaderActivity::loop() {
     pendingReadFolderMove = SETTINGS.moveFinishedToReadFolder && !isInReadFolder(epub->getPath());
   } else {
     pendingReadFolderMove = false;
+  }
+
+  // Short power button press toggles automatic page turn (when configured). The Down-button
+  // guard mirrors the footnotes handler: ignore a Power release that was part of the
+  // screenshot combo (Power+Down).
+  if (SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::TOGGLE_AUTO_TURN &&
+      mappedInput.wasReleased(MappedInputManager::Button::Power) &&
+      !mappedInput.wasReleased(MappedInputManager::Button::Down)) {
+    if (automaticPageTurnActive) {
+      automaticPageTurnActive = false;
+    } else {
+      startAutoPageTurn();
+    }
+    // Redraw to add/remove the corner indicator
+    requestUpdate();
+    return;
   }
 
   if (automaticPageTurnActive) {
@@ -635,6 +649,15 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
   };
 
   switch (action) {
+    case EpubReaderMenuActivity::MenuAction::START_AUTO_TURN: {
+      // Indicator gets drawn by the re-render that follows the menu pop.
+      startAutoPageTurn();
+      break;
+    }
+    case EpubReaderMenuActivity::MenuAction::AUTO_TURN_RATE: {
+      openAutoTurnRatePicker();
+      break;
+    }
     case EpubReaderMenuActivity::MenuAction::SELECT_CHAPTER: {
       const int spineIdx = currentSpineIndex;
       const std::string path = epub->getPath();
@@ -820,29 +843,49 @@ void EpubReaderActivity::applyOrientation(const uint8_t orientation) {
   }
 }
 
-void EpubReaderActivity::toggleAutoPageTurn(const uint8_t selectedPageTurnOption) {
-  if (selectedPageTurnOption == 0 || selectedPageTurnOption >= std::size(PAGE_TURN_RATES)) {
-    automaticPageTurnActive = false;
-    return;
-  }
-
+void EpubReaderActivity::startAutoPageTurn() {
+  // Belt and braces: the rate is range-clamped on load, but never divide-by-zero-adjacent here.
+  pageTurnDuration = std::max<uint8_t>(SETTINGS.autoTurnSecondsPerPage, 1) * 1000UL;
   lastPageTurnTime = millis();
-  // calculates page turn duration by dividing by number of pages
-  pageTurnDuration = (1UL * 60 * 1000) / PAGE_TURN_RATES[selectedPageTurnOption];
   automaticPageTurnActive = true;
+}
 
-  const uint8_t statusBarHeight = UITheme::getInstance().getStatusBarHeight();
-  // resets cached section so that space is reserved for auto page turn indicator when None or progress bar only
-  if (statusBarHeight == 0 || statusBarHeight == UITheme::getInstance().getProgressBarHeight()) {
-    // Preserve current reading position so we can restore after reflow.
-    RenderLock lock(*this);
-    if (section) {
-      cachedSpineIndex = currentSpineIndex;
-      cachedChapterTotalPageCount = section->pageCount;
-      nextPageNumber = section->currentPage;
-    }
-    section.reset();
-  }
+void EpubReaderActivity::openAutoTurnRatePicker() {
+  startActivityForResult(
+      std::make_unique<IntervalSelectionActivity>(
+          renderer, mappedInput, "AutoTurnRate", StrId::STR_AUTO_TURN_SECONDS_PER_PAGE, SETTINGS.autoTurnSecondsPerPage,
+          CrossPointSettings::AUTO_TURN_MIN_SECONDS, CrossPointSettings::AUTO_TURN_MAX_SECONDS, 1, 5,
+          StrId::STR_AUTO_TURN_SECONDS_FORMAT, true, true),
+      [this](const ActivityResult& result) {
+        if (result.isCancelled) {
+          return;
+        }
+        // No need to update a running timer: reaching this picker goes through the reader
+        // menu, and opening the menu (Confirm) always deactivates auto turn first.
+        const auto seconds = static_cast<uint8_t>(std::get<IntervalResult>(result.data).value);
+        // Value-change guard: don't rewrite settings.json when the rate is unchanged.
+        if (seconds != SETTINGS.autoTurnSecondsPerPage) {
+          SETTINGS.autoTurnSecondsPerPage = seconds;
+          SETTINGS.saveToFile();
+        }
+      });
+}
+
+void EpubReaderActivity::drawAutoTurnIndicator() const {
+  // Right triangle tucked into the top-right corner of the viewable area. The slightly
+  // larger white triangle underneath leaves a white seam along the hypotenuse so the
+  // marker stays legible over a black image (GfxRenderer has no pixel-invert support).
+  constexpr int TRIANGLE_SIZE = 16;
+  constexpr int OUTLINE_SIZE = 3;
+  int top, right, bottom, left;
+  renderer.getOrientedViewableTRBL(&top, &right, &bottom, &left);
+  const int xRight = renderer.getScreenWidth() - right - 1;
+  const int whiteX[3] = {xRight - TRIANGLE_SIZE - OUTLINE_SIZE, xRight, xRight};
+  const int whiteY[3] = {top, top, top + TRIANGLE_SIZE + OUTLINE_SIZE};
+  renderer.fillPolygon(whiteX, whiteY, 3, false);
+  const int blackX[3] = {xRight - TRIANGLE_SIZE, xRight, xRight};
+  const int blackY[3] = {top, top, top + TRIANGLE_SIZE};
+  renderer.fillPolygon(blackX, blackY, 3, true);
 }
 
 void EpubReaderActivity::pageTurn(bool isForwardTurn) {
@@ -924,16 +967,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
   orientedMarginRight += SETTINGS.screenMargin;
 
   const uint8_t statusBarHeight = UITheme::getInstance().getStatusBarHeight();
-
-  // reserves space for automatic page turn indicator when no status bar or progress bar only
-  if (automaticPageTurnActive &&
-      (statusBarHeight == 0 || statusBarHeight == UITheme::getInstance().getProgressBarHeight())) {
-    orientedMarginBottom +=
-        std::max(SETTINGS.screenMargin,
-                 static_cast<uint8_t>(statusBarHeight + UITheme::getInstance().getMetrics().statusBarVerticalMargin));
-  } else {
-    orientedMarginBottom += std::max(SETTINGS.screenMargin, statusBarHeight);
-  }
+  orientedMarginBottom += std::max(SETTINGS.screenMargin, statusBarHeight);
 
   const uint16_t viewportWidth = renderer.getScreenWidth() - orientedMarginLeft - orientedMarginRight;
   const uint16_t viewportHeight = renderer.getScreenHeight() - orientedMarginTop - orientedMarginBottom;
@@ -1261,6 +1295,9 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
 
   page->render(renderer, fontId, orientedMarginLeft, orientedMarginTop);
   renderStatusBar();
+  if (automaticPageTurnActive) {
+    drawAutoTurnIndicator();
+  }
   const auto tBwRender = millis();
 
   if (pageHasImages) {
@@ -1277,6 +1314,10 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
       // Re-render page content to restore images into the blanked area
       // Status bar is not re-rendered here to avoid reading stale dynamic values (e.g. battery %)
       page->render(renderer, fontId, orientedMarginLeft, orientedMarginTop);
+      // Restore the indicator in case the blanked image area overlapped the corner
+      if (automaticPageTurnActive) {
+        drawAutoTurnIndicator();
+      }
       renderer.displayBuffer(HalDisplay::FAST_REFRESH);
     } else {
       renderer.displayBuffer(HalDisplay::HALF_REFRESH);
@@ -1411,20 +1452,7 @@ void EpubReaderActivity::renderStatusBar() const {
 
   std::string title;
 
-  int textYOffset = 0;
-
-  if (automaticPageTurnActive) {
-    title = tr(STR_AUTO_TURN_ENABLED) + std::to_string(60 * 1000 / pageTurnDuration);
-
-    // calculates textYOffset when rendering title in status bar
-    const uint8_t statusBarHeight = UITheme::getInstance().getStatusBarHeight();
-
-    // offsets text if no status bar or progress bar only
-    if (statusBarHeight == 0 || statusBarHeight == UITheme::getInstance().getProgressBarHeight()) {
-      textYOffset += UITheme::getInstance().getMetrics().statusBarVerticalMargin;
-    }
-
-  } else if (SETTINGS.statusBarTitle == CrossPointSettings::STATUS_BAR_TITLE::CHAPTER_TITLE) {
+  if (SETTINGS.statusBarTitle == CrossPointSettings::STATUS_BAR_TITLE::CHAPTER_TITLE) {
     title = tr(STR_UNNAMED);
     const int tocIndex = epub->getTocIndexForSpineIndex(currentSpineIndex);
     if (tocIndex != -1) {
@@ -1436,7 +1464,7 @@ void EpubReaderActivity::renderStatusBar() const {
     title = epub->getTitle();
   }
 
-  GUI.drawStatusBar(renderer, bookProgress, currentPage, pageCount, title, 0, textYOffset, true, currentPageBookmarked,
+  GUI.drawStatusBar(renderer, bookProgress, currentPage, pageCount, title, 0, 0, true, currentPageBookmarked,
                     section->isBuilding());
 }
 

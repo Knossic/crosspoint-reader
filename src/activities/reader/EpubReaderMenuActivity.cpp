@@ -3,6 +3,9 @@
 #include <GfxRenderer.h>
 #include <I18n.h>
 
+#include <cstdio>
+
+#include "CrossPointSettings.h"
 #include "MappedInputManager.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
@@ -17,12 +20,17 @@ EpubReaderMenuActivity::EpubReaderMenuActivity(GfxRenderer& renderer, MappedInpu
       pendingOrientation(currentOrientation),
       currentPage(currentPage),
       totalPages(totalPages),
-      bookProgressPercent(bookProgressPercent) {}
+      bookProgressPercent(bookProgressPercent) {
+  snprintf(autoTurnRateLabel, sizeof(autoTurnRateLabel), I18N.get(StrId::STR_AUTO_TURN_SECONDS_FORMAT),
+           static_cast<unsigned int>(SETTINGS.autoTurnSecondsPerPage));
+}
 
 std::vector<EpubReaderMenuActivity::MenuItem> EpubReaderMenuActivity::buildMenuItems(bool hasFootnotes,
                                                                                      bool hasBookmarks) {
   std::vector<MenuItem> items;
-  items.reserve(12);
+  items.reserve(13);
+  // First row so auto turn starts with two Confirm presses from the reading view.
+  items.push_back({MenuAction::START_AUTO_TURN, StrId::STR_START_AUTO_TURN});
   items.push_back({MenuAction::SELECT_CHAPTER, StrId::STR_SELECT_CHAPTER});
   if (hasFootnotes) {
     items.push_back({MenuAction::FOOTNOTES, StrId::STR_FOOTNOTES});
@@ -32,7 +40,7 @@ std::vector<EpubReaderMenuActivity::MenuItem> EpubReaderMenuActivity::buildMenuI
   }
   items.push_back({MenuAction::TOGGLE_BOOKMARK, StrId::STR_TOGGLE_BOOKMARK});
   items.push_back({MenuAction::ROTATE_SCREEN, StrId::STR_ORIENTATION});
-  items.push_back({MenuAction::AUTO_PAGE_TURN, StrId::STR_AUTO_TURN_PAGES_PER_MIN});
+  items.push_back({MenuAction::AUTO_TURN_RATE, StrId::STR_AUTO_TURN_SECONDS_PER_PAGE});
   items.push_back({MenuAction::GO_TO_PERCENT, StrId::STR_GO_TO_PERCENT});
   items.push_back({MenuAction::SCREENSHOT, StrId::STR_SCREENSHOT_BUTTON});
   items.push_back({MenuAction::DISPLAY_QR, StrId::STR_DISPLAY_QR});
@@ -75,23 +83,13 @@ void EpubReaderMenuActivity::loop() {
       return;
     }
 
-    if (selectedAction == MenuAction::AUTO_PAGE_TURN) {
-      optionPopup.show(I18N.get(StrId::STR_AUTO_TURN_PAGES_PER_MIN), pageTurnLabels.data(),
-                       static_cast<int>(pageTurnLabels.size()), selectedPageTurnOption, [this](int idx) {
-                         selectedPageTurnOption = idx;
-                         requestUpdate();
-                       });
-      requestUpdate();
-      return;
-    }
-
-    setResult(MenuResult{static_cast<int>(selectedAction), pendingOrientation, selectedPageTurnOption});
+    setResult(MenuResult{static_cast<int>(selectedAction), pendingOrientation});
     finish();
     return;
   } else if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
     ActivityResult result;
     result.isCancelled = true;
-    result.data = MenuResult{-1, pendingOrientation, selectedPageTurnOption};
+    result.data = MenuResult{-1, pendingOrientation};
     setResult(std::move(result));
     finish();
     return;
@@ -133,9 +131,9 @@ void EpubReaderMenuActivity::render(RenderLock&&) {
         if (value == MenuAction::ROTATE_SCREEN) {
           // Render current orientation value on the right edge of the content area.
           return I18N.get(orientationLabels[pendingOrientation]);
-        } else if (value == MenuAction::AUTO_PAGE_TURN) {
-          // Render current page turn value on the right edge of the content area.
-          return pageTurnLabels[selectedPageTurnOption];
+        } else if (value == MenuAction::AUTO_TURN_RATE) {
+          // Render current auto-turn rate on the right edge of the content area.
+          return static_cast<const char*>(autoTurnRateLabel);
         } else {
           return "";
         }

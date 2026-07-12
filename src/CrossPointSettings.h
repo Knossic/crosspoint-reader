@@ -143,7 +143,15 @@ class CrossPointSettings {
   };
 
   // Short power button press actions
-  enum SHORT_PWRBTN { IGNORE = 0, SLEEP = 1, PAGE_TURN = 2, FORCE_REFRESH = 3, FOOTNOTES = 4, SHORT_PWRBTN_COUNT };
+  enum SHORT_PWRBTN {
+    IGNORE = 0,
+    SLEEP = 1,
+    PAGE_TURN = 2,
+    FORCE_REFRESH = 3,
+    FOOTNOTES = 4,
+    TOGGLE_AUTO_TURN = 5,
+    SHORT_PWRBTN_COUNT
+  };
 
   // Long-press Confirm action while reading an EPUB. The setting cycles through these values.
   // Persisted in settings.json by index: any new function (e.g. dictionary, bookmark) MUST use a
@@ -275,6 +283,9 @@ class CrossPointSettings {
   uint8_t language = 0;
   // Quick Resume: keep current content visible with moon icon instead of showing a static sleep screen.
   uint8_t quickResumeSleepScreen = QUICK_RESUME_NEVER;
+  // Automatic page turn interval in the reader (seconds spent on each page).
+  // Whether auto turn is currently running is transient reader state, never persisted.
+  uint8_t autoTurnSecondsPerPage = 15;
 
   ~CrossPointSettings() = default;
 
@@ -284,6 +295,9 @@ class CrossPointSettings {
   static constexpr uint8_t MIN_SLEEP_TIMEOUT_MINUTES = 1;
   static constexpr uint8_t SLEEP_TIMEOUT_NEVER_MINUTES = 31;
   static constexpr uint8_t MAX_SLEEP_TIMEOUT_MINUTES = SLEEP_TIMEOUT_NEVER_MINUTES;
+
+  static constexpr uint8_t AUTO_TURN_MIN_SECONDS = 3;
+  static constexpr uint8_t AUTO_TURN_MAX_SECONDS = 120;
 
   // Callback to resolve SD card font IDs. Set by SdCardFontSystem::begin().
   // Returns font ID or 0 if not found.

@@ -199,6 +199,12 @@ void SettingsActivity::toggleCurrentSetting() {
     return;
   }
 
+  // Wide 1-step range: cycling via Confirm presses is unusable, open the stepper instead.
+  if (setting.nameId == StrId::STR_AUTO_TURN_SECONDS_PER_PAGE) {
+    openAutoTurnRatePicker();
+    return;
+  }
+
   if (setting.type == SettingType::TOGGLE && setting.valuePtr != nullptr) {
     // Toggle the boolean value using the member pointer
     const bool currentValue = SETTINGS.*(setting.valuePtr);
@@ -333,6 +339,24 @@ void SettingsActivity::syncQuickResumeTimeoutForSleepScreen(bool sleepScreenChan
   }
 }
 
+void SettingsActivity::openAutoTurnRatePicker() {
+  startActivityForResult(
+      std::make_unique<IntervalSelectionActivity>(
+          renderer, mappedInput, "AutoTurnRate", StrId::STR_AUTO_TURN_SECONDS_PER_PAGE, SETTINGS.autoTurnSecondsPerPage,
+          CrossPointSettings::AUTO_TURN_MIN_SECONDS, CrossPointSettings::AUTO_TURN_MAX_SECONDS, 1, 5,
+          StrId::STR_AUTO_TURN_SECONDS_FORMAT, false, true),
+      [this](const ActivityResult& result) {
+        if (!result.isCancelled) {
+          const auto seconds = static_cast<uint8_t>(std::get<IntervalResult>(result.data).value);
+          if (seconds != SETTINGS.autoTurnSecondsPerPage) {
+            SETTINGS.autoTurnSecondsPerPage = seconds;
+            SETTINGS.saveToFile();
+          }
+        }
+        requestUpdate();
+      });
+}
+
 void SettingsActivity::openSleepTimeoutPicker() {
   startActivityForResult(
       std::make_unique<IntervalSelectionActivity>(
@@ -403,6 +427,11 @@ void SettingsActivity::render(RenderLock&&) {
                        static_cast<unsigned int>(SETTINGS.*(setting.valuePtr)));
               valueText = valueBuffer;
             }
+          } else if (setting.nameId == StrId::STR_AUTO_TURN_SECONDS_PER_PAGE) {
+            char valueBuffer[32];
+            snprintf(valueBuffer, sizeof(valueBuffer), tr(STR_AUTO_TURN_SECONDS_FORMAT),
+                     static_cast<unsigned int>(SETTINGS.*(setting.valuePtr)));
+            valueText = valueBuffer;
           } else {
             valueText = std::to_string(SETTINGS.*(setting.valuePtr));
           }
@@ -411,13 +440,14 @@ void SettingsActivity::render(RenderLock&&) {
       },
       true);
 
-  // Draw help text
-  const auto confirmLabel =
-      (selectedSettingIndex == 0)
-          ? I18N.get(categoryNames[(selectedCategoryIndex + 1) % categoryCount])
-          : (selectedSettingIndex > 0 && (*currentSettings)[selectedSettingIndex - 1].nameId == StrId::STR_TIME_TO_SLEEP
-                 ? tr(STR_SELECT)
-                 : tr(STR_TOGGLE));
+  // Draw help text. Rows that open a picker (rather than cycling in place) hint "Select".
+  const bool opensPicker =
+      selectedSettingIndex > 0 &&
+      ((*currentSettings)[selectedSettingIndex - 1].nameId == StrId::STR_TIME_TO_SLEEP ||
+       (*currentSettings)[selectedSettingIndex - 1].nameId == StrId::STR_AUTO_TURN_SECONDS_PER_PAGE);
+  const auto confirmLabel = (selectedSettingIndex == 0)
+                                ? I18N.get(categoryNames[(selectedCategoryIndex + 1) % categoryCount])
+                                : (opensPicker ? tr(STR_SELECT) : tr(STR_TOGGLE));
 
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), confirmLabel, tr(STR_DIR_UP), tr(STR_DIR_DOWN));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
