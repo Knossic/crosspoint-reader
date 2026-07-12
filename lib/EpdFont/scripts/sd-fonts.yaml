@@ -143,6 +143,18 @@ families:
       italic:     {url: "https://raw.githubusercontent.com/google/fonts/main/ofl/vollkorn/Vollkorn-Italic%5Bwght%5D.ttf", variable: {wght: 400}}
       bolditalic: {url: "https://raw.githubusercontent.com/google/fonts/main/ofl/vollkorn/Vollkorn-Italic%5Bwght%5D.ttf", variable: {wght: 700}}
 
+  - name: CrimsonPro
+    description: "Garamond-inspired old-style serif (Latin)"
+    intervals: latin-ext
+    sizes: [12, 14, 16, 18]
+    styles:
+      # Regular pinned at 500 (Medium): Crimson Pro's 400 hairlines are thin for
+      # 2-bit e-ink (same approach as Bitter). Instancer requires named instances.
+      regular:    {url: "https://raw.githubusercontent.com/google/fonts/main/ofl/crimsonpro/CrimsonPro%5Bwght%5D.ttf", variable: {wght: 500}}
+      bold:       {url: "https://raw.githubusercontent.com/google/fonts/main/ofl/crimsonpro/CrimsonPro%5Bwght%5D.ttf", variable: {wght: 700}}
+      italic:     {url: "https://raw.githubusercontent.com/google/fonts/main/ofl/crimsonpro/CrimsonPro-Italic%5Bwght%5D.ttf", variable: {wght: 500}}
+      bolditalic: {url: "https://raw.githubusercontent.com/google/fonts/main/ofl/crimsonpro/CrimsonPro-Italic%5Bwght%5D.ttf", variable: {wght: 700}}
+
   # ── Sans-serif ─────────────────────────────────────────────────────────
 
   - name: NotoSansExtended
