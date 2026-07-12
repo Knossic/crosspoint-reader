@@ -28,6 +28,7 @@
 #include "KOReaderCredentialStore.h"
 #include "KOReaderSyncActivity.h"
 #include "MappedInputManager.h"
+#include "PlaneRle.h"
 #include "ProgressMapper.h"
 #include "QrDisplayActivity.h"
 #include "ReaderUtils.h"
@@ -1301,31 +1302,76 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   const auto tBwRender = millis();
 
   // Overlapped grayscale path: kick the BW refresh without blocking, then render
-  // the LSB plane while the panel runs its ~500ms waveform — the CPU is otherwise
-  // idle for that whole window (it just polls BUSY). Only the LSB plane hides in
-  // the wait; the MSB plane renders serially after it (hiding both would need a
-  // second 48KB buffer, which this board's headroom can't spare). Needs a
-  // full-frame plane buffer: a transient per-page allocation, deliberately not a
-  // pinned member — chapter loads (which can want ~96KB for giant-spine inflation)
-  // happen between page renders, when this buffer is not held. On OOM fall
-  // through to the sequential 8KB-strip paths below. Image pages keep their
-  // double-refresh sequence: they re-render the framebuffer between refreshes,
-  // which the async contract forbids (the framebuffer is the differential
-  // baseline until the grayscale planes replace it).
+  // BOTH grayscale planes while the panel runs its ~500ms waveform — the CPU is
+  // otherwise idle for that whole window (it just polls BUSY). Controller RAM
+  // cannot be written while BUSY is asserted, so the planes must stage in DRAM
+  // until the wait ends; two raw planes would need 96KB, which this board's
+  // headroom can't spare. Instead each plane is rendered band-by-band into a
+  // small scratch (same tiling as the sequential fallback below) and RLE-packed
+  // into a store, all inside one plane-sized arena — the same 48KB peak as a
+  // single raw plane. Text planes are mostly 0x00 and compress 3-6x, so both
+  // typically fit; a plane that overflows the store (very dense page) is simply
+  // re-rendered live after the wait, which is no worse than not caching it. The
+  // arena is a transient per-page allocation, deliberately not a pinned member —
+  // chapter loads (which can want ~96KB for giant-spine inflation) happen
+  // between page renders, when this buffer is not held. On OOM fall through to
+  // the sequential 8KB-strip paths below. Image pages keep their double-refresh
+  // sequence: they re-render the framebuffer between refreshes, which the async
+  // contract forbids (the framebuffer is the differential baseline until the
+  // grayscale planes replace it).
   if (!pageHasImages && needsAnyGrayscale && renderer.supportsStripGrayscale() && renderer.supportsAsyncDisplay()) {
+    constexpr int STRIP_ROWS = 80;
+    constexpr int MAX_BANDS = 16;
     const int gh = renderer.getDisplayHeight();
-    const size_t planeBytes = static_cast<size_t>(renderer.getDisplayWidthBytes()) * gh;
-    auto plane = makeUniqueNoThrow<uint8_t[]>(planeBytes);
-    if (plane) {
+    const int gwBytes = renderer.getDisplayWidthBytes();
+    const int bands = (gh + STRIP_ROWS - 1) / STRIP_ROWS;
+    const size_t scratchBytes = static_cast<size_t>(gwBytes) * STRIP_ROWS;
+    const size_t planeBytes = static_cast<size_t>(gwBytes) * gh;
+    auto arena = (bands <= MAX_BANDS) ? makeUniqueNoThrow<uint8_t[]>(planeBytes) : nullptr;
+    if (arena) {
+      uint8_t* const scratch = arena.get();
+      uint8_t* const store = arena.get() + scratchBytes;
+      const size_t storeCap = planeBytes - scratchBytes;
+      uint16_t bandLen[2][MAX_BANDS];  // encoded band <= bandBytes + ceil(bandBytes/128), fits uint16
+      size_t planeStart[2] = {0, 0};
+      size_t planeSize[2] = {0, 0};
+      bool planeCached[2] = {false, false};
+      size_t storeUsed = 0;
+
       ReaderUtils::displayWithRefreshCycleAsyncStart(renderer, pagesUntilFullRefresh);
 
-      // LSB plane, rendered during the refresh wait.
-      renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
-      renderer.beginStripTarget(plane.get(), 0, gh);
-      renderer.clearScreen(0x00);
-      renderGrayscalePass();
-      renderer.endStripTarget();
-      const auto tGrayLsb = millis();
+      // Render one plane band-by-band into the scratch, RLE-appending each band
+      // to the store. On overflow rolls the store back and returns false.
+      auto renderAndCompressPlane = [&](int planeIdx, bool isLsb) {
+        const size_t start = storeUsed;
+        renderer.setRenderMode(isLsb ? GfxRenderer::GRAYSCALE_LSB : GfxRenderer::GRAYSCALE_MSB);
+        int band = 0;
+        for (int y = 0; y < gh; y += STRIP_ROWS, band++) {
+          const int rows = (gh - y < STRIP_ROWS) ? (gh - y) : STRIP_ROWS;
+          renderer.beginStripTarget(scratch, y, rows);
+          renderer.clearScreen(0x00);
+          renderGrayscalePass();
+          renderer.endStripTarget();
+          const size_t n =
+              PlaneRle::encode(scratch, static_cast<size_t>(gwBytes) * rows, store + storeUsed, storeCap - storeUsed);
+          if (n == 0) {
+            storeUsed = start;
+            return false;
+          }
+          bandLen[planeIdx][band] = static_cast<uint16_t>(n);
+          storeUsed += n;
+        }
+        planeStart[planeIdx] = start;
+        planeSize[planeIdx] = storeUsed - start;
+        planeCached[planeIdx] = true;
+        return true;
+      };
+
+      // If the LSB plane doesn't fit, the near-identical MSB plane won't either.
+      if (renderAndCompressPlane(0, true)) {
+        renderAndCompressPlane(1, false);
+      }
+      const auto tGrayInWait = millis();
 
       // Remaining waveform wait. The driver's post-refresh RAM resync is skipped:
       // both planes are overwritten with the gray LSB/MSB data right below, and
@@ -1334,16 +1380,39 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
       renderer.displayBufferAsyncFinish(true);
       const auto tDisplay = millis();
 
-      renderer.writeGrayscalePlaneStrip(true, plane.get(), 0, gh);
-
-      // MSB plane (panel idle from here on; buffer reused).
-      renderer.setRenderMode(GfxRenderer::GRAYSCALE_MSB);
-      renderer.beginStripTarget(plane.get(), 0, gh);
-      renderer.clearScreen(0x00);
-      renderGrayscalePass();
-      renderer.endStripTarget();
-      renderer.writeGrayscalePlaneStrip(false, plane.get(), 0, gh);
-      const auto tGrayMsb = millis();
+      // Panel idle from here on. Cached planes decompress into the scratch and
+      // stream straight out; an uncached plane re-renders its bands live.
+      auto uploadPlane = [&](int planeIdx, bool isLsb) {
+        if (!planeCached[planeIdx]) {
+          renderer.setRenderMode(isLsb ? GfxRenderer::GRAYSCALE_LSB : GfxRenderer::GRAYSCALE_MSB);
+        }
+        size_t off = planeStart[planeIdx];
+        int band = 0;
+        for (int y = 0; y < gh; y += STRIP_ROWS, band++) {
+          const int rows = (gh - y < STRIP_ROWS) ? (gh - y) : STRIP_ROWS;
+          bool haveBand = planeCached[planeIdx];
+          if (haveBand) {
+            haveBand =
+                PlaneRle::decode(store + off, bandLen[planeIdx][band], scratch, static_cast<size_t>(gwBytes) * rows);
+            off += bandLen[planeIdx][band];
+            if (!haveBand) {
+              // Can't happen for data we just encoded; render live as insurance.
+              LOG_ERR("ERS", "Gray plane RLE decode failed (plane %d band %d)", planeIdx, band);
+              renderer.setRenderMode(isLsb ? GfxRenderer::GRAYSCALE_LSB : GfxRenderer::GRAYSCALE_MSB);
+            }
+          }
+          if (!haveBand) {
+            renderer.beginStripTarget(scratch, y, rows);
+            renderer.clearScreen(0x00);
+            renderGrayscalePass();
+            renderer.endStripTarget();
+          }
+          renderer.writeGrayscalePlaneStrip(isLsb, scratch, y, rows);
+        }
+      };
+      uploadPlane(0, true);
+      uploadPlane(1, false);
+      const auto tUpload = millis();
 
       renderer.setRenderMode(GfxRenderer::BW);
       renderer.displayGrayBuffer();
@@ -1354,13 +1423,16 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
       renderer.cleanupGrayscaleWithFrameBuffer();
       const auto tEnd = millis();
       LOG_DBG("ERS",
-              "Page render (overlap): prewarm=%lums bw_render=%lums lsb_in_wait=%lums wait_finish=%lums "
-              "msb=%lums gray_display=%lums cleanup=%lums total=%lums",
-              tPrewarm - t0, tBwRender - tPrewarm, tGrayLsb - tBwRender, tDisplay - tGrayLsb, tGrayMsb - tDisplay,
-              tGrayDisplay - tGrayMsb, tEnd - tGrayDisplay, tEnd - t0);
+              "Page render (overlap+rle): prewarm=%lums bw_render=%lums gray_in_wait=%lums "
+              "(rle %u+%uB cached=%d%d) wait_finish=%lums upload=%lums gray_display=%lums cleanup=%lums total=%lums",
+              tPrewarm - t0, tBwRender - tPrewarm, tGrayInWait - tBwRender, static_cast<unsigned>(planeSize[0]),
+              static_cast<unsigned>(planeSize[1]), planeCached[0] ? 1 : 0, planeCached[1] ? 1 : 0,
+              tDisplay - tGrayInWait, tUpload - tDisplay, tGrayDisplay - tUpload, tEnd - tGrayDisplay, tEnd - t0);
       return;
     }
-    LOG_ERR("ERS", "OOM: gray plane buffer (%u bytes); sequential grayscale", static_cast<unsigned>(planeBytes));
+    if (bands <= MAX_BANDS) {
+      LOG_ERR("ERS", "OOM: gray arena (%u bytes); sequential grayscale", static_cast<unsigned>(planeBytes));
+    }
   }
 
   if (pageHasImages) {
