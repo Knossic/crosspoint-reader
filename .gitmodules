@@ -1,4 +1,4 @@
 [submodule "freeink-sdk"]
 	path = freeink-sdk
 	url = https://github.com/Knossic/freeink-sdk.git
-	branch = feature/async-display
+	branch = knossic
