@@ -4,6 +4,7 @@
 #include <HalStorage.h>
 #include <JpegToBmpConverter.h>
 #include <Logging.h>
+#include <Memory.h>
 #include <PngToBmpConverter.h>
 #include <Utf8.h>
 #include <ZipFile.h>
@@ -153,18 +154,11 @@ bool Epub::parseTocNcxFile() const {
 
   LOG_DBG("EBP", "Parsing toc ncx file: %s", tocNcxItem.c_str());
 
-  const auto tmpNcxPath = getCachePath() + "/toc.ncx";
-  HalFile tempNcxFile;
-  if (!Storage.openFileForWrite("EBP", tmpNcxPath, tempNcxFile)) {
+  size_t ncxSize;
+  if (!getItemSize(tocNcxItem, &ncxSize)) {
+    LOG_ERR("EBP", "Could not get size of toc ncx file");
     return false;
   }
-  readItemContentsToStream(tocNcxItem, tempNcxFile, 1024);
-  // Explicitly close() file before reopening for reading
-  tempNcxFile.close();
-  if (!Storage.openFileForRead("EBP", tmpNcxPath, tempNcxFile)) {
-    return false;
-  }
-  const auto ncxSize = tempNcxFile.size();
 
   TocNcxParser ncxParser(contentBasePath, ncxSize, bookMetadataCache.get());
 
@@ -173,28 +167,12 @@ bool Epub::parseTocNcxFile() const {
     return false;
   }
 
-  const auto ncxBuffer = static_cast<uint8_t*>(malloc(1024));
-  if (!ncxBuffer) {
-    LOG_ERR("EBP", "Could not allocate memory for toc ncx parser");
+  // Stream the decompressed NCX straight into the parser instead of round-tripping
+  // through a temp file on the SD card (decompress -> write -> reopen -> reread -> delete).
+  if (!readItemContentsToStream(tocNcxItem, ncxParser, 1024)) {
+    LOG_ERR("EBP", "Could not read toc ncx file");
     return false;
   }
-
-  while (tempNcxFile.available()) {
-    const auto readSize = tempNcxFile.read(ncxBuffer, 1024);
-    if (readSize == 0) break;
-    const auto processedSize = ncxParser.write(ncxBuffer, readSize);
-
-    if (processedSize != readSize) {
-      LOG_ERR("EBP", "Could not process all toc ncx data");
-      free(ncxBuffer);
-      return false;
-    }
-  }
-
-  free(ncxBuffer);
-  // Explicitly close() file before calling Storage.remove()
-  tempNcxFile.close();
-  Storage.remove(tmpNcxPath.c_str());
 
   LOG_DBG("EBP", "Parsed TOC items");
   return true;
@@ -209,18 +187,11 @@ bool Epub::parseTocNavFile() const {
 
   LOG_DBG("EBP", "Parsing toc nav file: %s", tocNavItem.c_str());
 
-  const auto tmpNavPath = getCachePath() + "/toc.nav";
-  HalFile tempNavFile;
-  if (!Storage.openFileForWrite("EBP", tmpNavPath, tempNavFile)) {
+  size_t navSize;
+  if (!getItemSize(tocNavItem, &navSize)) {
+    LOG_ERR("EBP", "Could not get size of toc nav file");
     return false;
   }
-  readItemContentsToStream(tocNavItem, tempNavFile, 1024);
-  // Explicitly close() file before reopening for reading
-  tempNavFile.close();
-  if (!Storage.openFileForRead("EBP", tmpNavPath, tempNavFile)) {
-    return false;
-  }
-  const auto navSize = tempNavFile.size();
 
   // Note: We can't use `contentBasePath` here as the nav file may be in a different folder to the content.opf
   // and the HTMLX nav file will have hrefs relative to itself
@@ -232,27 +203,12 @@ bool Epub::parseTocNavFile() const {
     return false;
   }
 
-  const auto navBuffer = static_cast<uint8_t*>(malloc(1024));
-  if (!navBuffer) {
-    LOG_ERR("EBP", "Could not allocate memory for toc nav parser");
+  // Stream the decompressed nav document straight into the parser instead of round-tripping
+  // through a temp file on the SD card (decompress -> write -> reopen -> reread -> delete).
+  if (!readItemContentsToStream(tocNavItem, navParser, 1024)) {
+    LOG_ERR("EBP", "Could not read toc nav file");
     return false;
   }
-
-  while (tempNavFile.available()) {
-    const auto readSize = tempNavFile.read(navBuffer, 1024);
-    const auto processedSize = navParser.write(navBuffer, readSize);
-
-    if (processedSize != readSize) {
-      LOG_ERR("EBP", "Could not process all toc nav data");
-      free(navBuffer);
-      return false;
-    }
-  }
-
-  free(navBuffer);
-  // Explicitly close() file before calling Storage.remove()
-  tempNavFile.close();
-  Storage.remove(tmpNavPath.c_str());
 
   LOG_DBG("EBP", "Parsed TOC nav items");
   return true;
@@ -282,7 +238,7 @@ void Epub::discoverCssFilesFromZip() {
   }
 }
 
-void Epub::parseCssFiles() const {
+CssParser::ParseResult Epub::parseCssFiles(const CssParser::CacheStatus existingCacheStatus) const {
   // Maximum CSS file size we'll attempt to parse (uncompressed)
   // Larger files risk memory exhaustion on ESP32
   constexpr size_t MAX_CSS_FILE_SIZE = 128 * 1024;  // 128KB
@@ -295,14 +251,71 @@ void Epub::parseCssFiles() const {
 
   LOG_DBG("EBP", "CSS files to parse: %zu", cssFiles.size());
 
-  // See if we have a cached version of the CSS rules
-  if (cssParser->hasCache()) {
-    LOG_DBG("EBP", "CSS cache exists, skipping parseCssFiles");
-    return;
+  const bool hasPartialCache = existingCacheStatus == CssParser::CacheStatus::Partial;
+  cssParser->clear();
+
+  // Some converters emit one byte-identical stylesheet per chapter (100+ .css
+  // entries), and each parse costs a zip locate plus an SD extract round-trip.
+  // Match each normalized CSS path to its central-directory (CRC32,
+  // compressed size) without throwing container allocations, then parse only
+  // the first of each identical pair. If scratch allocation fails, parsing all
+  // stylesheets is slower but remains correct.
+  struct CssDedupEntry {
+    uint64_t pathHash = 0;
+    uint64_t contentKey = 0;
+    size_t cssIndex = 0;
+  };
+  std::unique_ptr<CssDedupEntry[]> dedupEntries;
+  if (cssFiles.size() > 1) {
+    dedupEntries = makeUniqueNoThrow<CssDedupEntry[]>(cssFiles.size());
+  }
+  if (dedupEntries) {
+    for (size_t i = 0; i < cssFiles.size(); i++) {
+      dedupEntries[i].pathHash = ZipFile::fnvHash64(cssFiles[i].data(), cssFiles[i].size());
+      dedupEntries[i].cssIndex = i;
+    }
+    std::sort(dedupEntries.get(), dedupEntries.get() + cssFiles.size(),
+              [](const CssDedupEntry& lhs, const CssDedupEntry& rhs) { return lhs.pathHash < rhs.pathHash; });
+
+    ZipFile(filepath).enumerateFileEntries([&](std::string_view entryPath, uint32_t crc32, uint32_t compressedSize) {
+      if (!FsHelpers::hasCssExtension(entryPath)) {
+        return;
+      }
+
+      const uint64_t pathHash = ZipFile::fnvHash64(entryPath.data(), entryPath.size());
+      auto* match = std::lower_bound(
+          dedupEntries.get(), dedupEntries.get() + cssFiles.size(), pathHash,
+          [](const CssDedupEntry& candidate, const uint64_t hash) { return candidate.pathHash < hash; });
+      for (const auto* end = dedupEntries.get() + cssFiles.size(); match != end && match->pathHash == pathHash;
+           match++) {
+        if (entryPath == cssFiles[match->cssIndex]) {
+          match->contentKey = (static_cast<uint64_t>(crc32) << 32) | compressedSize;
+          break;
+        }
+      }
+    });
+    std::sort(dedupEntries.get(), dedupEntries.get() + cssFiles.size(),
+              [](const CssDedupEntry& lhs, const CssDedupEntry& rhs) { return lhs.cssIndex < rhs.cssIndex; });
+  } else if (cssFiles.size() > 1) {
+    LOG_ERR("EBP", "Insufficient heap for CSS deduplication; parsing every stylesheet");
   }
 
+  size_t skippedDuplicates = 0;
+  CssParser::ParseResult parseResult = CssParser::ParseResult::Complete;
+
   // No cache yet - parse CSS files
-  for (const auto& cssPath : cssFiles) {
+  for (size_t cssIndex = 0; cssIndex < cssFiles.size(); cssIndex++) {
+    const auto& cssPath = cssFiles[cssIndex];
+    const uint64_t dedupKey = dedupEntries ? dedupEntries[cssIndex].contentKey : 0;
+    if (dedupKey != 0) {
+      const bool seen =
+          std::any_of(dedupEntries.get(), dedupEntries.get() + cssIndex,
+                      [dedupKey](const CssDedupEntry& candidate) { return candidate.contentKey == dedupKey; });
+      if (seen) {
+        skippedDuplicates++;
+        continue;
+      }
+    }
     LOG_DBG("EBP", "Parsing CSS file: %s", cssPath.c_str());
 
     // Check heap before parsing - CSS parsing allocates heavily
@@ -310,6 +323,9 @@ void Epub::parseCssFiles() const {
     if (freeHeap < MIN_HEAP_FOR_CSS_PARSING) {
       LOG_ERR("EBP", "Insufficient heap for CSS parsing (%u bytes free, need %zu), skipping: %s", freeHeap,
               MIN_HEAP_FOR_CSS_PARSING, cssPath.c_str());
+      if (parseResult == CssParser::ParseResult::Complete) {
+        parseResult = CssParser::ParseResult::Partial;
+      }
       continue;
     }
 
@@ -319,6 +335,9 @@ void Epub::parseCssFiles() const {
       if (cssFileSize > MAX_CSS_FILE_SIZE) {
         LOG_ERR("EBP", "CSS file too large (%zu bytes > %zu max), skipping: %s", cssFileSize, MAX_CSS_FILE_SIZE,
                 cssPath.c_str());
+        if (parseResult == CssParser::ParseResult::Complete) {
+          parseResult = CssParser::ParseResult::Partial;
+        }
         continue;
       }
     }
@@ -328,6 +347,7 @@ void Epub::parseCssFiles() const {
     HalFile tempCssFile;
     if (!Storage.openFileForWrite("EBP", tmpCssPath, tempCssFile)) {
       LOG_ERR("EBP", "Could not create temp CSS file");
+      parseResult = CssParser::ParseResult::Error;
       continue;
     }
     if (!readItemContentsToStream(cssPath, tempCssFile, 1024)) {
@@ -335,6 +355,7 @@ void Epub::parseCssFiles() const {
       // Explicitly close() file before calling Storage.remove()
       tempCssFile.close();
       Storage.remove(tmpCssPath.c_str());
+      parseResult = CssParser::ParseResult::Error;
       continue;
     }
     // Explicitly close() file before reopening for reading
@@ -344,21 +365,51 @@ void Epub::parseCssFiles() const {
     if (!Storage.openFileForRead("EBP", tmpCssPath, tempCssFile)) {
       LOG_ERR("EBP", "Could not open temp CSS file for reading");
       Storage.remove(tmpCssPath.c_str());
+      parseResult = CssParser::ParseResult::Error;
       continue;
     }
-    cssParser->loadFromStream(tempCssFile);
+    const CssParser::ParseResult streamResult = cssParser->loadFromStream(tempCssFile);
     // Explicitly close() file before calling Storage.remove()
     tempCssFile.close();
     Storage.remove(tmpCssPath.c_str());
+    if (streamResult == CssParser::ParseResult::Error) {
+      parseResult = CssParser::ParseResult::Error;
+    } else if (streamResult == CssParser::ParseResult::Partial && parseResult == CssParser::ParseResult::Complete) {
+      parseResult = CssParser::ParseResult::Partial;
+    }
   }
 
-  // Save to cache for next time
-  if (!cssParser->saveToCache()) {
+  if (parseResult == CssParser::ParseResult::Error) {
+    LOG_ERR("EBP", "CSS parse failed; preserving any previous cache for a later retry");
+    cssParser->clear();
+    return parseResult;
+  }
+
+  if (parseResult == CssParser::ParseResult::Partial && cssParser->empty()) {
+    LOG_ERR("EBP", "CSS parsing stopped before any usable rules were loaded; cache will not be replaced");
+    cssParser->clear();
+    return CssParser::ParseResult::Error;
+  }
+
+  if (parseResult == CssParser::ParseResult::Partial && hasPartialCache) {
+    LOG_DBG("EBP", "CSS retry remained partial; preserving the previous partial cache");
+    cssParser->clear();
+    return parseResult;
+  }
+
+  // A partial cache remains useful for this session, but its header ensures a
+  // later EPUB load retries the source stylesheets when more heap is available.
+  if (!cssParser->saveToCache(parseResult == CssParser::ParseResult::Complete)) {
     LOG_ERR("EBP", "Failed to save CSS rules to cache");
+    cssParser->clear();
+    return CssParser::ParseResult::Error;
   }
 
-  LOG_DBG("EBP", "Loaded %zu CSS style rules from %zu files", cssParser->ruleCount(), cssFiles.size());
+  LOG_DBG("EBP", "Loaded %zu CSS style rules from %zu files (%zu identical duplicates skipped, %s)",
+          cssParser->ruleCount(), cssFiles.size(), skippedDuplicates,
+          parseResult == CssParser::ParseResult::Complete ? "complete" : "partial");
   cssParser->clear();
+  return parseResult;
 }
 
 // load in the meta data for the epub file
@@ -373,29 +424,51 @@ bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss) {
   // Try to load existing cache first
   if (bookMetadataCache->load()) {
     if (!skipLoadingCss) {
-      // Rebuild CSS cache when missing or when cache version changed (loadFromCache removes stale file)
-      if (!cssParser->hasCache() || !cssParser->loadFromCache()) {
-        LOG_DBG("EBP", "CSS rules cache missing or stale, attempting to parse CSS files");
-        cssParser->deleteCache();
+      const CssParser::CacheStatus cacheStatus = cssParser->inspectCache();
+      CssParser::CacheLoadResult cacheLoadResult = CssParser::CacheLoadResult::Invalid;
+      if (cacheStatus == CssParser::CacheStatus::Complete) {
+        cacheLoadResult = cssParser->loadFromCache();
+      }
+
+      if (cacheLoadResult == CssParser::CacheLoadResult::LowMemory) {
+        LOG_ERR("EBP", "Insufficient heap to load CSS cache; keeping it for a later retry");
+      } else if (cacheLoadResult != CssParser::CacheLoadResult::Complete) {
+        LOG_DBG("EBP", "CSS cache missing, partial, or invalid; attempting to parse source stylesheets");
+        if (cacheStatus == CssParser::CacheStatus::Invalid ||
+            (cacheStatus == CssParser::CacheStatus::Complete &&
+             cacheLoadResult == CssParser::CacheLoadResult::Invalid)) {
+          cssParser->deleteCache();
+        }
 
         BookMetadataCache::BookMetadata cachedMetadata = bookMetadataCache->coreMetadata;
+        CssParser::ParseResult cssParseResult = CssParser::ParseResult::Error;
         if (!parseContentOpf(cachedMetadata, /*writeSpineEntries=*/false)) {
           LOG_ERR("EBP", "Could not parse content.opf from cached bookMetadata for CSS files");
-          // continue anyway - book will work without CSS and we'll still load any inline style CSS
         } else {
           discoverCssFilesFromZip();
+          bookMetadataCache.reset();
+          cssParseResult = parseCssFiles(cacheStatus);
         }
         bookMetadataCache.reset();
-        parseCssFiles();
         bookMetadataCache.reset(new BookMetadataCache(cachePath));
         if (!bookMetadataCache->load()) {
           LOG_ERR("EBP", "Failed to reload cache after CSS rebuild");
           return false;
         }
-        // Invalidate section caches so they are rebuilt with the new CSS
-        Storage.removeDir((cachePath + "/sections").c_str());
+        const bool cssCacheChanged =
+            cssParseResult == CssParser::ParseResult::Complete ||
+            (cssParseResult == CssParser::ParseResult::Partial && cacheStatus != CssParser::CacheStatus::Partial);
+        if (cssCacheChanged) {
+          // The CSS cache changed, so section caches must use the same rule set.
+          Storage.removeDir((cachePath + "/sections").c_str());
+        }
       }
     }
+    // Release the resolved CSS rule map: it is only needed transiently while building
+    // section caches, and createSectionFile reloads it from cache on demand. Holding it
+    // resident pins tens of KB for the whole reading session (more on warm resume into
+    // an already-cached chapter, where createSectionFile never runs to clear it).
+    cssParser->clear();
     LOG_DBG("EBP", "Loaded ePub: %s", filepath.c_str());
     return true;
   }
@@ -489,8 +562,9 @@ bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss) {
   if (!skipLoadingCss) {
     // Parse CSS before reloading book.bin to leave more heap for CSS rule-table growth.
     bookMetadataCache.reset();
-    parseCssFiles();
-    Storage.removeDir((cachePath + "/sections").c_str());
+    if (parseCssFiles(cssParser->inspectCache()) != CssParser::ParseResult::Error) {
+      Storage.removeDir((cachePath + "/sections").c_str());
+    }
   }
 
   // Reload the cache from disk so it's in the correct state
@@ -768,14 +842,31 @@ uint8_t* Epub::readItemContentsToBytes(const std::string& itemHref, size_t* size
   return content;
 }
 
-bool Epub::readItemContentsToStream(const std::string& itemHref, Print& out, const size_t chunkSize) const {
+bool Epub::readItemContentsToStream(const std::string& itemHref, Print& out, const size_t chunkSize,
+                                    const bool allowEarlyStop) const {
   if (itemHref.empty()) {
     LOG_DBG("EBP", "Failed to read item, empty href");
     return false;
   }
 
   const std::string path = FsHelpers::normalisePath(itemHref);
-  return ZipFile(filepath).readFileToStream(path.c_str(), out, chunkSize);
+  return ZipFile(filepath).readFileToStream(path.c_str(), out, chunkSize, allowEarlyStop);
+}
+
+bool Epub::extractItemToFile(const std::string& itemHref, const std::string& destPath) const {
+  HalFile out;
+  if (!Storage.openFileForWrite("EBP", destPath, out)) {
+    return false;
+  }
+  // Large images dominate lazy extraction. Match the section streamer size to
+  // halve SD read/write calls while adding only 8 KB of transient ZIP buffers.
+  const bool ok = readItemContentsToStream(itemHref, out, 8192);
+  out.flush();
+  out.close();
+  if (!ok) {
+    Storage.remove(destPath.c_str());
+  }
+  return ok;
 }
 
 bool Epub::getItemSize(const std::string& itemHref, size_t* size) const {
@@ -790,7 +881,12 @@ int Epub::getSpineItemsCount() const {
   return bookMetadataCache->getSpineCount();
 }
 
-size_t Epub::getCumulativeSpineItemSize(const int spineIndex) const { return getSpineItem(spineIndex).cumulativeSize; }
+size_t Epub::getCumulativeSpineItemSize(const int spineIndex) const {
+  if (!bookMetadataCache || !bookMetadataCache->isLoaded()) {
+    return 0;
+  }
+  return bookMetadataCache->getCumulativeSize(spineIndex);
+}
 
 BookMetadataCache::SpineEntry Epub::getSpineItem(const int spineIndex) const {
   if (!bookMetadataCache || !bookMetadataCache->isLoaded()) {

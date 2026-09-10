@@ -28,8 +28,8 @@ const EpdGlyph* EpdFontFamily::getGlyph(const uint32_t cp, const Style style) co
   return getFont(style)->getGlyph(cp);
 }
 
-const EpdGlyph* EpdFontFamily::getGlyphOrNull(const uint32_t cp, const Style style) const {
-  return getFont(style)->getGlyphOrNull(cp);
+bool EpdFontFamily::hasCodepoint(const uint32_t cp, const Style style) const {
+  return getFont(style)->hasCodepoint(cp);
 }
 
 int8_t EpdFontFamily::getKerning(const uint32_t leftCp, const uint32_t rightCp, const Style style) const {

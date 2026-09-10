@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "Epub.h"
+#include "ReaderRenderSpec.h"
 
 class Page;
 class GfxRenderer;
@@ -19,9 +20,7 @@ class Section {
   std::string filePath;
   HalFile file;
 
-  void writeSectionFileHeader(int fontId, float lineCompression, bool extraParagraphSpacing, uint8_t paragraphAlignment,
-                              uint16_t viewportWidth, uint16_t viewportHeight, bool hyphenationEnabled,
-                              bool embeddedStyle, uint8_t imageRendering, bool focusReadingEnabled);
+  void writeSectionFileHeader(const ReaderRenderSpec& spec);
   uint32_t onPageComplete(std::unique_ptr<Page> page);
 
   // Page-offset table entry, kept in RAM while an incremental build is running so
@@ -30,6 +29,7 @@ class Section {
     uint32_t fileOffset;
     uint16_t paragraphIndex;
     uint16_t listItemIndex;
+    uint32_t visibleTextOffset;
   };
   // Held only while an incremental build is in progress (see startBuild). Carries the
   // live parser plus the strings it references (the parser stores them by reference)
@@ -52,12 +52,6 @@ class Section {
     // the EMA is stepped once per build advance (not per redraw) to damp that wobble.
     float smoothedEstimate = 0;
     uint32_t smoothedAtConsumed = 0;
-    // Blocking-build progress popup (createSectionFile path only; unset on the
-    // incremental path). Receives percent 0-100; redraws throttled in
-    // buildSomeMore() because each popup repaint costs a display refresh.
-    std::function<void(int)> popupFn;
-    int lastPopupPct = 0;
-    unsigned long lastPopupMs = 0;
   };
   std::unique_ptr<BuildContext> build_;
   bool buildComplete_ = false;
@@ -91,26 +85,20 @@ class Section {
   // forward-declared ChapterHtmlSlimParser, whose full definition is only visible in the .cpp.
   explicit Section(const std::shared_ptr<Epub>& epub, int spineIndex, GfxRenderer& renderer);
   ~Section();
-  bool loadSectionFile(int fontId, float lineCompression, bool extraParagraphSpacing, uint8_t paragraphAlignment,
-                       uint16_t viewportWidth, uint16_t viewportHeight, bool hyphenationEnabled, bool embeddedStyle,
-                       uint8_t imageRendering, bool focusReadingEnabled);
+  bool loadSectionFile(const ReaderRenderSpec& spec);
   bool clearCache() const;
-  bool createSectionFile(int fontId, float lineCompression, bool extraParagraphSpacing, uint8_t paragraphAlignment,
-                         uint16_t viewportWidth, uint16_t viewportHeight, bool hyphenationEnabled, bool embeddedStyle,
-                         uint8_t imageRendering, bool focusReadingEnabled,
-                         const std::function<void(int)>& popupFn = nullptr);
+  bool createSectionFile(const ReaderRenderSpec& spec, const std::function<void()>& popupFn = nullptr);
 
   // Incremental build: lay out the section a few pages at a time so a large chapter
   // can show its first page immediately and keep the UI responsive while the rest
   // builds. createSectionFile() above is the one-shot wrapper over these.
   //   if (!startBuild(...)) fail;
   //   each tick: buildSomeMore(N); render up to pageCount; when isBuildComplete() stop.
-  bool startBuild(int fontId, float lineCompression, bool extraParagraphSpacing, uint8_t paragraphAlignment,
-                  uint16_t viewportWidth, uint16_t viewportHeight, bool hyphenationEnabled, bool embeddedStyle,
-                  uint8_t imageRendering, bool focusReadingEnabled, const std::function<void(int)>& popupFn = nullptr);
+  bool startBuild(const ReaderRenderSpec& spec, const std::function<void()>& popupFn = nullptr);
   // Lay out up to maxPages more pages (maxPages <= 0 = build to completion). Returns
   // false on error (the build is abandoned). Sets isBuildComplete() when finished.
   bool buildSomeMore(int maxPages);
+  int buildProgressPercent() const;
   bool isBuilding() const { return static_cast<bool>(build_); }
   bool isBuildComplete() const { return buildComplete_; }
   // Best-known total page count: the exact pageCount once finalized, or a smoothed byte-based
@@ -160,4 +148,23 @@ class Section {
 
   // Look up the synthetic paragraph index for the given rendered page.
   std::optional<uint16_t> getParagraphIndexForPage(uint16_t page) const;
+
+  // Exact zero-based visible Unicode-codepoint offset where a rendered page
+  // starts. Available from both an active build and finalized/partial caches.
+  std::optional<uint32_t> getVisibleTextOffsetForPage(uint16_t page) const;
+
+  // Derive the local page containing an exact visible-text offset. When
+  // preferFirstAtOffset is true, ties caused by zero-width content such as an
+  // image-only page select the first page at that offset.
+  std::optional<uint16_t> getPageForVisibleTextOffset(uint32_t offset, bool preferFirstAtOffset = false) const;
+
+  // True once the active build has laid out a page starting at or past `offset`, i.e.
+  // getPageForVisibleTextOffset() can resolve it from the build without laying out more.
+  // Lets a caller build to a content target instead of a page number, which is what a
+  // re-pagination needs: the old page index no longer names the same content.
+  // False with no build running -- there is nothing left to wait for, so the on-disk
+  // cache answers directly.
+  bool buildReachedVisibleTextOffset(uint32_t offset) const {
+    return build_ && !build_->lut.empty() && offset <= build_->lut.back().visibleTextOffset;
+  }
 };
