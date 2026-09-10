@@ -60,3 +60,4 @@ add_subdirectory(chapter_position)
 add_subdirectory(inflate_stream)
 
 add_subdirectory(font_fallback)
+add_subdirectory(sd_card_font)

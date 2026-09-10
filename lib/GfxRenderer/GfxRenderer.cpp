@@ -83,6 +83,9 @@ const uint8_t* GfxRenderer::getGlyphBitmap(const EpdFontData* fontData, const Ep
     if (sdFont->isOverflowGlyph(glyph)) {
       return sdFont->getOverflowBitmap(glyph);  // may be nullptr for zero-width glyphs
     }
+    if (!fontData->bitmap || glyph->dataOffset == SdCardFont::DEFERRED_BITMAP_OFFSET) {
+      return sdFont->getDeferredBitmap(fontData, glyph);
+    }
   }
   return &fontData->bitmap[glyph->dataOffset];
 }

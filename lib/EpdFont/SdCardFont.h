@@ -22,9 +22,8 @@
 class SdCardFont {
  public:
   static constexpr uint16_t MAX_PAGE_GLYPHS = 512;
-  // prewarmStyle: the bitmap arena did not fit the largest free block.
-  // Distinct from a missed-glyph count so the caller can retry smaller.
-  static constexpr int PREWARM_ARENA_TOO_LARGE = -2;
+  // In-memory marker only; never written to the .cpfont file.
+  static constexpr uint32_t DEFERRED_BITMAP_OFFSET = UINT32_MAX;
   static constexpr uint8_t MAX_STYLES = 4;
 
   SdCardFont() = default;
@@ -121,6 +120,9 @@ class SdCardFont {
 
   // Returns the bitmap for an on-demand-loaded (overflow) glyph.
   const uint8_t* getOverflowBitmap(const EpdGlyph* glyph) const;
+
+  // Load an uncached mini-table bitmap on demand. Call only for mini glyphs.
+  const uint8_t* getDeferredBitmap(const EpdFontData* fontData, const EpdGlyph* glyph);
 
   // Extract SdCardFont* from an opaque glyphMissCtx pointer.
   // Used by GfxRenderer::getGlyphBitmap() to recover the SdCardFont from EpdFontData::glyphMissCtx.
@@ -226,10 +228,8 @@ class SdCardFont {
     // underuse-hysteresis signal; 0 = no bitmap built this scope (metadata-only
     // prewarm), which leaves the hysteresis counter untouched.
     uint32_t miniBitmapUsed = 0;
-    // Exact bitmap bytes per glyph of the last requested set, for the arena retry.
-    uint32_t measuredBytesPerGlyph = 0;
     uint8_t miniUnderuseRuns = 0;
-    // True when the resident mini was built metadata-only (no bitmaps): it can
+    // True for an explicit metadata-only prewarm (not a partial bitmap cache): it can
     // serve metadata requests but a full render request must rebuild.
     bool miniMetadataOnly = false;
     // Set by a rebuild, consumed by resetStyleMiniData: gates the underuse
