@@ -1,5 +1,6 @@
 #include "ReaderActivity.h"
 
+#include <FontCacheManager.h>
 #include <FsHelpers.h>
 #include <HalStorage.h>
 #include <Memory.h>
@@ -71,6 +72,13 @@ void ReaderActivity::onEnter() {
 
 void ReaderActivity::onExit() {
   Activity::onExit();
+
+  // Page-scale SD font arenas (bitmap arena, glyph tables, kern classes) are
+  // dead weight outside the reader and starve the next book's cache build;
+  // UI screens rebuild the few fallback glyphs they draw on demand.
+  if (auto* fcm = renderer.getFontCacheManager()) {
+    fcm->releaseSdFontCaches();
+  }
 
   renderer.setOrientation(GfxRenderer::Orientation::Portrait);
   APP_STATE.readerActivityLoadCount = 0;

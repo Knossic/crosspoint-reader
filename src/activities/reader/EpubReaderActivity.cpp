@@ -6,6 +6,7 @@
 #include <FsHelpers.h>
 #include <GfxRenderer.h>
 #include <HalFrontlight.h>
+#include <HalPowerManager.h>
 #include <HalStorage.h>
 #include <I18n.h>
 #include <Logging.h>
@@ -371,6 +372,10 @@ void EpubReaderActivity::loop() {
       ESP.getFreeHeap() > RENDER_MIN_FREE_HEAP && ESP.getMaxAllocHeap() > BACKGROUND_BUILD_MIN_MAX_ALLOC &&
       (idlePrewarmSpine != currentSpineIndex || idlePrewarmPage != section->currentPage)) {
     RenderLock lock;
+    // The prewarm can land after IDLE_POWER_SAVING_MS (a render that ran
+    // long, or a background build that held it back); at the 10 MHz idle
+    // clock its ~500 ms becomes ~4 s during which loop() takes no input.
+    HalPowerManager::Lock powerLock;
     if (section && !section->isBuilding() &&
         (idlePrewarmSpine != currentSpineIndex || idlePrewarmPage != section->currentPage)) {
       idlePrewarmSpine = currentSpineIndex;
@@ -382,6 +387,10 @@ void EpubReaderActivity::loop() {
             const auto t0 = millis();
             auto scope = fcm->createPrewarmScope();
             p->render(renderer, SETTINGS.getReaderFontId(), 0, 0);
+            // Same scope as the real turn (renderContents): a fallback-font
+            // status bar title must be resident too, or the turn misses the
+            // subset check and rebuilds the mini in the foreground.
+            renderStatusBar();
             scope.endScanAndPrewarm();
             LOG_DBG("ERS", "Idle prewarm: page %d in %lums", nextPage, millis() - t0);
           }

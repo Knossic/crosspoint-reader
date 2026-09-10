@@ -45,8 +45,11 @@ class SdCardFont {
   // Default 0x0F = all present styles.
   // When metadataOnly=true, only glyph metrics are loaded (no bitmap data).
   // Accumulative: codepoints already resident from earlier prewarms stay
-  // resident (the rebuild unions them with the request, up to MAX_PAGE_GLYPHS),
-  // so per-string callers converge instead of evicting each other.
+  // resident (the rebuild unions them with the request) so per-string callers
+  // converge instead of evicting each other. Retention is bounded by the
+  // bitmap arena: resident glyphs the request does not name are kept only
+  // while their bitmaps still fit beside the request's, so a page that
+  // overflows the arena keeps nothing from earlier pages.
   // Returns number of glyphs that couldn't be loaded (0 on full success).
   int prewarm(const char* utf8Text, uint8_t styleMask = 0x0F, bool metadataOnly = false, bool loadKernLig = true);
 
@@ -228,6 +231,10 @@ class SdCardFont {
     // underuse-hysteresis signal; 0 = no bitmap built this scope (metadata-only
     // prewarm), which leaves the hysteresis counter untouched.
     uint32_t miniBitmapUsed = 0;
+    // Bitmap bytes every resident glyph needs, cached or deferred. Sizes the
+    // union budget and the heap-pressure estimate; miniBitmapUsed only covers
+    // the part that fit.
+    uint32_t miniBitmapNeeded = 0;
     uint8_t miniUnderuseRuns = 0;
     // True for an explicit metadata-only prewarm (not a partial bitmap cache): it can
     // serve metadata requests but a full render request must rebuild.

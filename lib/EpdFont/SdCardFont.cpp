@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <climits>
 #include <cstring>
+#include <iterator>
 #include <memory>
 
 #include "EpdFontFamily.h"
@@ -71,6 +72,9 @@ const char* asCStr(const char* s) { return s; }
 // resetStyleMiniData retention bounds (see the PerStyle comment in the header).
 constexpr size_t MINI_RETAIN_MIN_FREE_HEAP = 40 * 1024;
 constexpr uint8_t MINI_UNDERUSE_RUNS_BEFORE_FREE = 3;
+// Left free beside a partial bitmap arena for the overflow ring and the
+// render path's own small allocations.
+constexpr uint32_t BITMAP_HEADROOM = 4 * 1024;
 
 // Keep-if-fits buffer reuse: only reallocate when the needed size exceeds the
 // current capacity. Freeing + reallocating slightly different sizes every page
@@ -107,6 +111,7 @@ void SdCardFont::freeStyleMiniData(PerStyle& s) {
   s.miniGlyphCapacity = 0;
   s.miniBitmapCapacity = 0;
   s.miniBitmapUsed = 0;
+  s.miniBitmapNeeded = 0;
   s.miniUnderuseRuns = 0;
   freeStyleMiniKern(s);
   memset(&s.miniData, 0, sizeof(s.miniData));
@@ -939,8 +944,16 @@ int SdCardFont::prewarmStyle(uint8_t styleIdx, const uint32_t* codepoints, uint3
   // bar after the page scope); replacing meant every string evicted every
   // other string's glyphs, so each measure/draw re-hit the SD forever. With
   // the union, residency converges after one pass and redraws are RAM-only.
-  // Over MAX_PAGE_GLYPHS the union is abandoned (request-only rebuild), which
-  // bounds mini RAM to the same worst case as a single dense page.
+  //
+  // Retention is bounded by the bitmap arena. The request always goes in;
+  // resident glyphs it does not name follow (ascending) only while their
+  // bitmaps would still fit beside the request's, and only while the total
+  // stays under MAX_PAGE_GLYPHS. A page that already overflows the arena keeps
+  // nothing from earlier pages: on a fragmented heap the partial arena is
+  // spent on glyphs the page draws instead of glyphs it no longer needs, and
+  // the glyph count converges instead of growing until a cliff.
+  const uint32_t* requestCps = codepoints;
+  const uint32_t requestCount = cpCount;
   std::unique_ptr<uint32_t[]> unionCps;
   if (s.miniGlyphCount > 0 && s.miniIntervalCount > 0 && ESP.getFreeHeap() < MINI_RETAIN_MIN_FREE_HEAP) {
     // Heap-tight (e.g. a chapter list stacked over an open book). Size-aware:
@@ -952,7 +965,7 @@ int SdCardFont::prewarmStyle(uint8_t styleIdx, const uint32_t* codepoints, uint3
     // pre-merge behavior, and the freed arena gives the small alloc room.
     const uint32_t unionMaxCount = s.miniGlyphCount + cpCount;  // pre-dedup upper bound
     const uint32_t avgBitmapBytes =
-        (s.miniBitmapUsed > 0 && s.miniGlyphCount > 0) ? s.miniBitmapUsed / s.miniGlyphCount : 64;
+        (s.miniBitmapNeeded > 0 && s.miniGlyphCount > 0) ? s.miniBitmapNeeded / s.miniGlyphCount : 64;
     const uint32_t estArenaBytes = unionMaxCount * (static_cast<uint32_t>(sizeof(EpdGlyph)) + avgBitmapBytes);
     constexpr uint32_t UNION_PRESSURE_HEADROOM = 12 * 1024;
     if (estArenaBytes + UNION_PRESSURE_HEADROOM > ESP.getFreeHeap()) {
@@ -960,42 +973,73 @@ int SdCardFont::prewarmStyle(uint8_t styleIdx, const uint32_t* codepoints, uint3
     }
   }
   if (s.miniGlyphCount > 0 && s.miniIntervalCount > 0) {
+    // A full mini must stay full: a metadata-only request may not drop
+    // bitmaps other strings are still rendering from.
+    const bool fullMini = !(metadataOnly && s.miniMetadataOnly);
+    // Arena bytes left for stale glyphs once the request is served. The
+    // request's resident glyphs are exact; unseen ones are estimated from the
+    // resident average. The arena either exists already (keep-if-fits) or is
+    // carved from the largest free block, minus the usual headroom.
+    uint32_t staleBudget = UINT32_MAX;
+    if (fullMini) {
+      const uint32_t maxAlloc = ESP.getMaxAllocHeap();
+      const uint32_t arenaBudget =
+          std::max(s.miniBitmapCapacity, maxAlloc > BITMAP_HEADROOM ? maxAlloc - BITMAP_HEADROOM : 0);
+      const uint32_t avgBitmapBytes = s.miniBitmapNeeded / s.miniGlyphCount;
+      uint32_t requestBytes = 0;
+      uint32_t ivi = 0;
+      for (uint32_t ri = 0; ri < cpCount; ri++) {
+        const uint32_t cp = codepoints[ri];
+        while (ivi < s.miniIntervalCount && s.miniIntervals[ivi].last < cp) ivi++;
+        if (ivi < s.miniIntervalCount && cp >= s.miniIntervals[ivi].first) {
+          requestBytes += s.miniGlyphs[s.miniIntervals[ivi].offset + (cp - s.miniIntervals[ivi].first)].dataLength;
+        } else {
+          requestBytes += avgBitmapBytes;
+        }
+      }
+      staleBudget = arenaBudget > requestBytes ? arenaBudget - requestBytes : 0;
+    }
     const uint32_t unionMax = s.miniGlyphCount + cpCount;
     unionCps.reset(new (std::nothrow) uint32_t[unionMax]);
     if (unionCps) {
       // Two-way sorted merge: resident stream walks the mini intervals
       // (ascending), request stream is the caller's sorted codepoint array.
+      // Every iteration consumes one stream element, so n <= unionMax.
       uint32_t n = 0;
       uint32_t ivIdx = 0;
       uint32_t ivCp = s.miniIntervals[0].first;
+      uint32_t ivGlyph = s.miniIntervals[0].offset;
       bool ivActive = true;
       uint32_t ri = 0;
-      while ((ivActive || ri < cpCount) && n < unionMax) {
-        uint32_t next;
-        if (ivActive && (ri >= cpCount || ivCp <= codepoints[ri])) {
-          next = ivCp;
-          if (ri < cpCount && codepoints[ri] == ivCp) ri++;
-          if (ivCp < s.miniIntervals[ivIdx].last) {
-            ivCp++;
-          } else if (++ivIdx < s.miniIntervalCount) {
-            ivCp = s.miniIntervals[ivIdx].first;
-          } else {
-            ivActive = false;
-          }
-        } else {
-          next = codepoints[ri++];
+      while (ivActive || ri < cpCount) {
+        if (!ivActive || (ri < cpCount && codepoints[ri] < ivCp)) {
+          unionCps[n++] = codepoints[ri++];
+          continue;
         }
-        unionCps[n++] = next;
+        const bool requested = ri < cpCount && codepoints[ri] == ivCp;
+        if (requested) ri++;
+        bool keep = requested;
+        if (!requested && n + 1 + (cpCount - ri) <= MAX_PAGE_GLYPHS) {
+          const uint32_t bitmapLen = s.miniGlyphs[ivGlyph].dataLength;
+          if (!fullMini || bitmapLen <= staleBudget) {
+            if (fullMini) staleBudget -= bitmapLen;
+            keep = true;
+          }
+        }
+        if (keep) unionCps[n++] = ivCp;
+        if (ivCp < s.miniIntervals[ivIdx].last) {
+          ivCp++;
+          ivGlyph++;
+        } else if (++ivIdx < s.miniIntervalCount) {
+          ivCp = s.miniIntervals[ivIdx].first;
+          ivGlyph = s.miniIntervals[ivIdx].offset;
+        } else {
+          ivActive = false;
+        }
       }
-      if (!ivActive && ri >= cpCount && n <= MAX_PAGE_GLYPHS) {
-        // A full mini must stay full: a metadata-only request may not drop
-        // bitmaps other strings are still rendering from.
-        metadataOnly = metadataOnly && s.miniMetadataOnly;
-        codepoints = unionCps.get();
-        cpCount = n;
-      } else {
-        unionCps.reset();
-      }
+      metadataOnly = metadataOnly && s.miniMetadataOnly;
+      codepoints = unionCps.get();
+      cpCount = n;
     }
   }
 
@@ -1003,6 +1047,7 @@ int SdCardFont::prewarmStyle(uint8_t styleIdx, const uint32_t* codepoints, uint3
   struct CpGlyphMapping {
     uint32_t codepoint;
     int32_t globalIndex;
+    bool requested;  // named by this request (not only retained from earlier ones)
   };
   CpGlyphMapping* mappings = new (std::nothrow) CpGlyphMapping[cpCount];
   if (!mappings) {
@@ -1011,11 +1056,14 @@ int SdCardFont::prewarmStyle(uint8_t styleIdx, const uint32_t* codepoints, uint3
   }
 
   uint32_t validCount = 0;
+  uint32_t rq = 0;  // both arrays are sorted: one pass marks the request
   for (uint32_t i = 0; i < cpCount; i++) {
     int32_t idx = findGlobalGlyphIndex(s, codepoints[i]);
     if (idx >= 0) {
+      while (rq < requestCount && requestCps[rq] < codepoints[i]) rq++;
       mappings[validCount].codepoint = codepoints[i];
       mappings[validCount].globalIndex = idx;
+      mappings[validCount].requested = rq < requestCount && requestCps[rq] == codepoints[i];
       validCount++;
     }
   }
@@ -1125,18 +1173,16 @@ int SdCardFont::prewarmStyle(uint8_t styleIdx, const uint32_t* codepoints, uint3
   }
 
   uint32_t totalBitmapSize = 0;
+  for (uint32_t i = 0; i < validCount; i++) {
+    totalBitmapSize += s.miniGlyphs[i].dataLength;
+  }
+  s.miniBitmapNeeded = totalBitmapSize;
 
   if (!metadataOnly) {
-    // Compute total bitmap size
-    for (uint32_t i = 0; i < validCount; i++) {
-      totalBitmapSize += s.miniGlyphs[i].dataLength;
-    }
-
     if (!ensureArrayCapacity(s.miniBitmap, s.miniBitmapCapacity, totalBitmapSize)) {
       LOG_INF("SDCF", "Deferring %u bitmap bytes for style %u; keeping %u glyph metrics", totalBitmapSize, styleIdx,
               validCount);
       const uint32_t maxAlloc = ESP.getMaxAllocHeap();
-      constexpr uint32_t BITMAP_HEADROOM = 4 * 1024;
       const uint32_t smallerSize =
           maxAlloc > BITMAP_HEADROOM ? std::min(totalBitmapSize, maxAlloc - BITMAP_HEADROOM) : 0;
       if (smallerSize > 0 && !ensureArrayCapacity(s.miniBitmap, s.miniBitmapCapacity, smallerSize)) {
@@ -1144,12 +1190,17 @@ int SdCardFont::prewarmStyle(uint8_t styleIdx, const uint32_t* codepoints, uint3
       }
     }
 
-    // Read bitmap data sorted by file offset
-    std::sort(readOrder, readOrder + validCount,
-              [&](uint32_t a, uint32_t b) { return s.miniGlyphs[a].dataOffset < s.miniGlyphs[b].dataOffset; });
+    // Fill the arena with the request's glyphs first, then whatever retained
+    // glyphs still fit; within each group read in file order so runs stay
+    // sequential. Deferred glyphs load through the overflow ring at draw time.
+    std::sort(readOrder, readOrder + validCount, [&](uint32_t a, uint32_t b) {
+      if (mappings[a].requested != mappings[b].requested) return mappings[a].requested;
+      return s.miniGlyphs[a].dataOffset < s.miniGlyphs[b].dataOffset;
+    });
 
     uint32_t miniBitmapOffset = 0;
     uint32_t lastBitmapEnd = UINT32_MAX;
+    uint32_t deferredRequested = 0;
     for (uint32_t i = 0; i < validCount; i++) {
       uint32_t mapIdx = readOrder[i];
       EpdGlyph& glyph = s.miniGlyphs[mapIdx];
@@ -1161,6 +1212,7 @@ int SdCardFont::prewarmStyle(uint8_t styleIdx, const uint32_t* codepoints, uint3
 
       if (glyph.dataLength > s.miniBitmapCapacity - miniBitmapOffset) {
         glyph.dataOffset = DEFERRED_BITMAP_OFFSET;
+        if (mappings[mapIdx].requested) deferredRequested++;
         continue;
       }
 
@@ -1190,6 +1242,10 @@ int SdCardFont::prewarmStyle(uint8_t styleIdx, const uint32_t* codepoints, uint3
     }
     totalBitmapSize = miniBitmapOffset;
     s.miniBitmapUsed = totalBitmapSize;
+    if (deferredRequested > 0) {
+      LOG_DBG("SDCF", "Bitmap cache style %u: %u/%u bytes, %u of %u requested glyphs deferred", styleIdx,
+              s.miniBitmapUsed, s.miniBitmapNeeded, deferredRequested, requestCount);
+    }
   }
 
   uint32_t sdTime = millis() - sdStart;
@@ -1497,20 +1553,34 @@ int SdCardFont::buildAdvanceTableRange(Iter begin, Iter end, bool includeSpace, 
   unsigned long startMs = millis();
 
   // +2 reserved slots for space and hyphen injected after the main scan.
+  // The full 16KB buffer needs a contiguous block a reader mid-book (bitmap
+  // arena held) often lacks; a smaller buffer still batches the common case
+  // (a text block has a few hundred unique codepoints), and anything past the
+  // cap lays out through per-glyph loads exactly as a cap hit always did.
   static constexpr uint32_t MAX_UNIQUE_CODEPOINTS = 4096;
-  uint32_t* codepoints = new (std::nothrow) uint32_t[MAX_UNIQUE_CODEPOINTS + 2];
+  static constexpr uint32_t CODEPOINT_BUFFER_STEPS[] = {MAX_UNIQUE_CODEPOINTS, 1024, 256};
+  uint32_t* codepoints = nullptr;
+  uint32_t cpCap = 0;
+  for (const uint32_t step : CODEPOINT_BUFFER_STEPS) {
+    codepoints = new (std::nothrow) uint32_t[step + 2];
+    if (codepoints) {
+      cpCap = step;
+      break;
+    }
+  }
   if (!codepoints) {
-    LOG_ERR("SDCF", "buildAdvanceTable: failed to allocate codepoint buffer (%u bytes)", MAX_UNIQUE_CODEPOINTS * 4);
+    LOG_ERR("SDCF", "buildAdvanceTable: failed to allocate codepoint buffer (%u bytes)",
+            CODEPOINT_BUFFER_STEPS[std::size(CODEPOINT_BUFFER_STEPS) - 1] * 4);
     return -1;
   }
   uint32_t cpCount = 0;
   bool hitCap = false;
 
   for (auto it = begin; it != end && !hitCap; ++it) {
-    hitCap = collectUniqueCodepoints(asCStr(*it), codepoints, cpCount, MAX_UNIQUE_CODEPOINTS);
+    hitCap = collectUniqueCodepoints(asCStr(*it), codepoints, cpCount, cpCap);
   }
   if (extraText && !hitCap) {
-    hitCap = collectUniqueCodepoints(extraText, codepoints, cpCount, MAX_UNIQUE_CODEPOINTS);
+    hitCap = collectUniqueCodepoints(extraText, codepoints, cpCount, cpCap);
   }
 
   if (includeSpace && std::none_of(codepoints, codepoints + cpCount, [](uint32_t c) { return c == ' '; }))
@@ -1519,8 +1589,7 @@ int SdCardFont::buildAdvanceTableRange(Iter begin, Iter end, bool includeSpace, 
     codepoints[cpCount++] = '-';
 
   if (hitCap) {
-    LOG_ERR("SDCF", "buildAdvanceTable: unique codepoint cap (%u) hit, layout may be approximate",
-            MAX_UNIQUE_CODEPOINTS);
+    LOG_ERR("SDCF", "buildAdvanceTable: unique codepoint cap (%u) hit, layout may be approximate", cpCap);
   }
   std::sort(codepoints, codepoints + cpCount);
   int totalMissed = fetchAdvancesForCodepoints(codepoints, cpCount, styleMask);
