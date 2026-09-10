@@ -184,8 +184,15 @@ bool EpubReaderActivity::loadBook() {
 
   bool loaded;
   {
-    std::optional<GfxRenderer::FrameBufferLoan> loan;
-    if (uncached) loan.emplace(renderer);
+    // Even a metadata-cache hit may need ZIP scratch to rebuild the CSS cache.
+    GfxRenderer::FrameBufferLoan loan(renderer);
+    loaded = loadedEpub->load(uncached, SETTINGS.embeddedStyle == 0);
+  }
+  if (!loaded && !uncached) {
+    // An existing cache can be stale or invalid after a firmware update.
+    disableFastInitialRefresh();
+    GUI.drawPopup(renderer, tr(STR_INDEXING));
+    GfxRenderer::FrameBufferLoan loan(renderer);
     loaded = loadedEpub->load(true, SETTINGS.embeddedStyle == 0);
   }
   if (!loaded) {
