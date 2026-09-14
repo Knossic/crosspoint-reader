@@ -73,6 +73,7 @@ class Section {
   // partial/finalized file stays readable while a rebuild is in progress.
   std::string binTmpPath() const { return filePath + ".part"; }
   std::unique_ptr<Page> loadPageAt(int page) const;
+  void releaseFontArenasForBuild() const;
   // Read a page already laid out by the in-progress build (page < build LUT size), from
   // the partially-written tmp .bin without disturbing the build's write cursor.
   std::unique_ptr<Page> loadPageDuringBuild(int page);

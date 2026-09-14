@@ -20,6 +20,10 @@ class FontCacheManager {
   // loaded. Everything faults back in on demand. For heap-critical transitions
   // (e.g. web-server + WiFi startup); see SdCardFont::releaseResidentCaches().
   void releaseSdFontCaches();
+  // Release the page-scale arenas only (SD mini data, overflow rings, the
+  // decompressor's page cache); advance and kern class tables stay. Called
+  // by section builds, which never draw from them and need the heap.
+  void releaseSdFontArenas();
   void prewarmCache(int fontId, const char* utf8Text, uint8_t styleMask = 0x0F);
   void logStats(const char* label = "render");
   void resetStats();

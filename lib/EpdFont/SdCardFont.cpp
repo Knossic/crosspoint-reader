@@ -201,6 +201,15 @@ void SdCardFont::releaseResidentCaches() {
   }
 }
 
+void SdCardFont::releaseMiniArenas() {
+  clearOverflow();
+  for (uint8_t i = 0; i < MAX_STYLES; i++) {
+    if (!styles_[i].present) continue;
+    freeStyleMiniData(styles_[i]);
+    applyGlyphMissCallback(i);
+  }
+}
+
 void SdCardFont::freeAll() {
   clearOverflow();
   clearPersistentCache();

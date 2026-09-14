@@ -1,5 +1,7 @@
 #include "Section.h"
 
+#include <FontCacheManager.h>
+#include <GfxRenderer.h>
 #include <HalStorage.h>
 #include <Logging.h>
 #include <Memory.h>
@@ -256,11 +258,21 @@ bool Section::createSectionFile(const ReaderRenderSpec& spec, const std::functio
   return buildComplete_;
 }
 
+// Layout never draws from the render font arenas, and the caller holds the
+// render lock, so a build step drops them first: the next render rebuilds
+// them, while CSS resolution (CssParser::resolveStyle) needs the heap now.
+void Section::releaseFontArenasForBuild() const {
+  if (auto* fcm = renderer.getFontCacheManager()) {
+    fcm->releaseSdFontArenas();
+  }
+}
+
 bool Section::startBuild(const ReaderRenderSpec& spec, const std::function<void()>& popupFn) {
   if (build_) {
     LOG_ERR("SCT", "startBuild called while a build is already active");
     return false;
   }
+  releaseFontArenasForBuild();
   buildComplete_ = false;
   builtPageCount_ = 0;
   // Pages from a loaded partial stay readable (from filePath) while this build writes
@@ -449,6 +461,7 @@ bool Section::buildSomeMore(const int maxPages) {
     LOG_ERR("SCT", "buildSomeMore with no active build");
     return false;
   }
+  releaseFontArenasForBuild();
   // Pace on pages laid out by THIS build, not pageCount: during a rebuild over a partial,
   // pageCount stays pinned at the partial's watermark until the build passes it, which
   // would otherwise turn one "small" chunk into a blocking rebuild of the whole watermark.

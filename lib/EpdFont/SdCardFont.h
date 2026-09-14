@@ -101,6 +101,13 @@ class SdCardFont {
   // a clean start and an OOM abort.
   void releaseResidentCaches();
 
+  // Release only the page-scale arenas (mini glyph/kern/bitmap data and the
+  // overflow ring) and fall back to the stub. Persistent advance tables and
+  // kern/ligature class tables stay so layout keeps batching. For section
+  // builds: the arenas are dead weight until the next render rebuilds them,
+  // and their ~30KB is what keeps CSS resolution above its heap floor.
+  void releaseMiniArenas();
+
   // Returns pointer to the managed EpdFont for a given style.
   // Returns nullptr if the style is not present.
   EpdFont* getEpdFont(uint8_t style = 0);

@@ -177,6 +177,26 @@ TEST_F(SdCardFontTest, AdvanceTableFallsBackToSmallerBufferWhenFragmented) {
   for (uint32_t cp = 32; cp < 64; ++cp) EXPECT_EQ(font.getAdvance(cp, 0), 256) << "cp " << cp;
 }
 
+TEST_F(SdCardFontTest, ReleaseMiniArenasKeepsAdvanceTableAndRebuildsOnPrewarm) {
+  font.prewarm(text.c_str(), 1, false, false);
+  ASSERT_EQ(font.buildAdvanceTable(text.c_str(), 1), 0);
+  ASSERT_NE(font.getEpdFont()->data->bitmap, nullptr);
+  font.releaseMiniArenas();
+  EXPECT_EQ(font.getEpdFont()->data->bitmap, nullptr);
+  EXPECT_EQ(font.getEpdFont()->data->intervalCount, 0u);
+  const auto before = sdReadCount;
+  EXPECT_TRUE(font.hasAdvanceTable());
+  for (uint32_t cp = 32; cp < 64; ++cp) EXPECT_EQ(font.getAdvance(cp, 0), 256) << "cp " << cp;
+  EXPECT_EQ(sdReadCount, before);
+  // Glyphs still resolve through the miss handler, and a prewarm rebuilds the arena.
+  const auto* glyph = font.getEpdFont()->getGlyph(63);
+  ASSERT_NE(glyph, nullptr);
+  EXPECT_TRUE(font.isOverflowGlyph(glyph));
+  font.prewarm(text.c_str(), 1, false, false);
+  ASSERT_NE(font.getEpdFont()->data->bitmap, nullptr);
+  EXPECT_EQ(bitmap(font.getEpdFont()->getGlyph(63))[127], 31);
+}
+
 TEST_F(SdCardFontTest, FailedDeferredReadPreservesMetricsAndCachedBitmaps) {
   prewarmFragmented(true);
   unlink(path);

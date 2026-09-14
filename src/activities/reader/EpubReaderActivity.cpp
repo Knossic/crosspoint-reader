@@ -369,7 +369,7 @@ void EpubReaderActivity::loop() {
   constexpr unsigned long IDLE_PREWARM_DEBOUNCE_MS = 400;
   if (section && !section->isBuilding() && !RenderLock::peek() && renderer.hasFrameBuffer() &&
       lastRenderCompleteMs != 0 && millis() - lastRenderCompleteMs > IDLE_PREWARM_DEBOUNCE_MS &&
-      ESP.getFreeHeap() > RENDER_MIN_FREE_HEAP && ESP.getMaxAllocHeap() > BACKGROUND_BUILD_MIN_MAX_ALLOC &&
+      ESP.getFreeHeap() > RENDER_MIN_FREE_HEAP && ESP.getMaxAllocHeap() > IDLE_PREWARM_MIN_MAX_ALLOC &&
       (idlePrewarmSpine != currentSpineIndex || idlePrewarmPage != section->currentPage)) {
     RenderLock lock;
     // The prewarm can land after IDLE_POWER_SAVING_MS (a render that ran

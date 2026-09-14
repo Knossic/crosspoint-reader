@@ -113,6 +113,11 @@ class EpubReaderActivity final : public ReaderActivity {
   bool buildTickHeapGate();
   bool buildHeapPaused = false;
   static constexpr size_t RENDER_MIN_FREE_HEAP = 24 * 1024;
+  // Largest block the idle prewarm itself needs: SdCardFont::prewarmStyle's
+  // per-glyph mapping/read-order arrays top out near 6KB at MAX_PAGE_GLYPHS,
+  // Page::deserialize allocates per line, and the bitmap arena degrades to a
+  // partial fill on its own. The build gate (16KB) is for the parser.
+  static constexpr size_t IDLE_PREWARM_MIN_MAX_ALLOC = 8 * 1024;
   static constexpr int BUILD_WINDOW_AHEAD = 5;
   static constexpr int PARTIAL_REBUILD_START_MARGIN = 15;
   static constexpr int BUILD_POPUP_PAGE_THRESHOLD = 20;
